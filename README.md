@@ -87,9 +87,9 @@ from unicorrn.inference import (
 
 MODEL_CONFIG_PATH = "/your_project_path/configs/models/unicorrn_large_stage2.yml"
 CKPT_PATH = "/your_project_path/pretrained_models/UniCorrn_Large_Stage2.pth"
-GRID_SIZE = 32
+GRID_SIZE = 4
 CONFIDENCE_THRESHOLD = 3.8
-MATCHING_RADIUS_PX = 5.0
+MATCHING_RADIUS_PX = 1.0
 
 # ---- Shared setup: load model and input images ----
 model_cfg = read_yaml_config(MODEL_CONFIG_PATH)
