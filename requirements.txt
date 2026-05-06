@@ -36,3 +36,4 @@ open3d
 pykeops
 jupyterlab
 plotly
+nbstripout
