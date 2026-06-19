@@ -1,3 +1,12 @@
+"""DETR-style query matching decoder with dual appearance+positional streams.
+
+The decoder iterates point/image queries against fixed image memory using
+Gaussian attention (L2-distance kernel via xformers). Three value streams
+share one attention matrix: appearance features, positional embeddings, and
+raw coordinate residuals for deep supervision. The frustum fork adds a
+per-layer ``FrustumHead`` on the pcd→img path.
+"""
+
 from functools import partial
 
 import torch
@@ -6,7 +15,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from ...utils.config import configurable
-from ..blocks import DualStreamQueryDecoderBlock, GaussianKNNSample, Mlp
+from ..blocks import DualStreamQueryDecoderBlock, FrustumHead, GaussianKNNSample, Mlp
 from ..blocks.utils import freeze_modules, offset2batch
 from ..embedder import InvertibleLinearPositionEmbedding
 from .build import DECODER_REGISTRY
@@ -73,6 +82,7 @@ class QueryMatchingDecoder(nn.Module):
         )
 
         self.info_embed = Mlp(project_dim, hidden_features=project_dim, out_features=1)
+        self.frustum_head = FrustumHead(project_dim, pos_embed_dim, coord_dim=2)
         self.last_layer_res_only = last_layer_res_only
 
     def freeze_2d_weights(self):
@@ -278,6 +288,10 @@ class QueryMatchingDecoder(nn.Module):
         target_pos=None,
         **kwargs,
     ):
+        """Decode 3D point queries against image memory.
+
+        Returns a 7-tuple: ``(corr, info, frustum_out, q, src_desc, tgt_desc, gm_out)``.
+        """
         assert (
             query_pos.shape[-1] == 3
         ), f"Invalid queries dim. Expected 3 but received {query_pos.shape[-1]}"
@@ -301,6 +315,7 @@ class QueryMatchingDecoder(nn.Module):
         )
         gm_res = torch.cat([patch_coord_map, _padding], dim=-1)
         gm_out = []
+        frustum_out = []
 
         for idx, block in enumerate(self.query_decoder_blocks):
             gm_res_ = None
@@ -322,13 +337,14 @@ class QueryMatchingDecoder(nn.Module):
             if len(ret) == 3:
                 q, hidden_state, gm_tgt = ret
                 gm_out.append(gm_tgt[..., :2])
+                frustum_out.append(self.frustum_head(q, hidden_state, gm_tgt[..., :2]))
             else:
                 q, hidden_state = ret
 
         corr = self.corr_embed_2d(hidden_state)
         info = self.info_embed(q)
 
-        return corr, info, q, src_desc, tgt_desc, gm_out
+        return corr, info, frustum_out, q, src_desc, tgt_desc, gm_out
 
     def forward_pcd_to_pcd(
         self,

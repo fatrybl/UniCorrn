@@ -9,10 +9,11 @@ TRAINER_REGISTRY = Registry('TRAINERS')
 
 @TRAINER_REGISTRY.register(name="unified_trainer")
 class UnifiedTrainer:
-    def __init__(self, img2img_wt=1.0, img2pcd_wt=1.0, pcd2pcd_wt=1.0):
+    def __init__(self, img2img_wt=1.0, img2pcd_wt=1.0, pcd2pcd_wt=1.0, frustum_wt=0.0):
         self.img2img_wt = img2img_wt
         self.img2pcd_wt = img2pcd_wt
         self.pcd2pcd_wt = pcd2pcd_wt
+        self.frustum_wt = frustum_wt
 
     def _run_step_img2img(self, model, batch, matching_loss_fn, feature_loss_fn, **kwargs):
         img1 = batch['img1']
@@ -30,7 +31,9 @@ class UnifiedTrainer:
         loss_details["total_loss"] = loss.item()
         return loss, loss_details
 
-    def _run_step_img2pcd(self, model, batch, matching_loss_fn, feature_loss_fn, **kwargs):
+    def _run_step_img2pcd(
+        self, model, batch, matching_loss_fn, feature_loss_fn, frustum_loss_fn=None, **kwargs
+    ):
         img = batch["image"]
 
         queries_2d = batch['queries']
@@ -39,13 +42,24 @@ class UnifiedTrainer:
         targets_2d = batch['norm_queries']
         targets_3d = batch['norm_targets']
 
-        pred = model(task="img2pcd", src_img=img, sample=batch, query_pos_2d=queries_2d, query_pos_3d=queries_3d)
+        frustum_queries = batch.get('frustum_queries')
+        pred = model(
+            task="img2pcd", src_img=img, sample=batch, query_pos_2d=queries_2d,
+            query_pos_3d=queries_3d, frustum_query_pos_3d=frustum_queries,
+        )
 
         loss_img2pcd, loss_details_img2pcd = matching_loss_fn(pred['img2pcd'], targets_3d)
         loss_pcd2img, loss_details_pcd2img = matching_loss_fn(pred['pcd2img'], targets_2d)
 
         loss = loss_img2pcd + loss_pcd2img
         loss_details = {}
+
+        if frustum_loss_fn is not None and frustum_queries is not None:
+            frustum_loss, frustum_details = frustum_loss_fn(
+                pred['frustum_intermediates'], batch['frustum_labels']
+            )
+            loss = loss + self.frustum_wt * frustum_loss
+            loss_details.update(frustum_details)
 
         for key, val in loss_details_img2pcd.items():
             loss_details[f"img2pcd_{key}"] = val
@@ -76,7 +90,9 @@ class UnifiedTrainer:
         loss_details['total_loss'] = loss.item()
         return loss, loss_details
 
-    def run_step(self, model, batch, matching_loss_fn, feature_loss_fn=None, **kwargs):
+    def run_step(
+        self, model, batch, matching_loss_fn, feature_loss_fn=None, frustum_loss_fn=None, **kwargs
+    ):
         loss = 0
         loss_details = {}
 
@@ -99,6 +115,7 @@ class UnifiedTrainer:
                 batch["img2pcd"],
                 matching_loss_fn,
                 feature_loss_fn,
+                frustum_loss_fn=frustum_loss_fn,
                 **kwargs
             )
 

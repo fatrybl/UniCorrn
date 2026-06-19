@@ -1,3 +1,10 @@
+"""UniCorrn: Unified Correspondence Transformer Across 2D and 3D.
+
+Dual-encoder (CroCo V2 image + PTv3 point cloud) model with a DETR-style
+Gaussian-attention decoder for cross-modal matching. The frustum fork adds a
+``FrustumHead`` in the pcd→img decoder path for geometric frustum classification.
+"""
+
 import torch
 import torch.nn as nn
 
@@ -165,7 +172,16 @@ class UniCorrn(nn.Module):
             "gm_intermediates": gm_out,
         }
 
-    def forward_img_to_pcd(self, src_img, sample, query_pos_2d, query_pos_3d=None):
+    def _frustum_pcd_to_img(self, point, img_feat, query_pos, patch_coord_map):
+        """Classify extra 3D queries as in/out camera frustum, reusing encoded features."""
+        frustum_out = self.decoder.forward_pcd_to_img(
+            point.feat, point, img_feat, query_pos, patch_coord_map=patch_coord_map
+        )[2]
+        return frustum_out[-1], frustum_out
+
+    def forward_img_to_pcd(
+        self, src_img, sample, query_pos_2d, query_pos_3d=None, frustum_query_pos_3d=None
+    ):
         B, C, H, W = src_img.shape
 
         tgt_point = {
@@ -199,7 +215,7 @@ class UniCorrn(nn.Module):
                 patch_shape=patch_shape,
                 target_pos=query_pos_3d,
             )
-            (out_pcd2img, info_pcd2img, qfeat_tgt, _, _, gm_out_pcd2img) = (
+            (out_pcd2img, info_pcd2img, _, qfeat_tgt, _, _, gm_out_pcd2img) = (
                 self.decoder.forward_pcd_to_img(
                     tgt_point.feat,
                     tgt_point,
@@ -209,7 +225,7 @@ class UniCorrn(nn.Module):
                 )
             )
 
-            return {
+            output = {
                 "img2pcd": {
                     "corr_predictions": out_img2pcd,
                     "info_predictions": info_img2pcd,
@@ -225,6 +241,13 @@ class UniCorrn(nn.Module):
                 "desc_src": desc_src,
                 "desc_tgt": desc_tgt,
             }
+            if frustum_query_pos_3d is not None:
+                output["frustum_predictions"], output["frustum_intermediates"] = (
+                    self._frustum_pcd_to_img(
+                        tgt_point, src_feat, frustum_query_pos_3d, patch_coord_map
+                    )
+                )
+            return output
 
         out, info, qfeat_src, desc_src, desc_tgt, gm_out = (
             self.decoder.forward_img_to_pcd(
@@ -236,7 +259,7 @@ class UniCorrn(nn.Module):
             )
         )
 
-        return {
+        output = {
             "img2pcd": {"corr_predictions": out, "info_predictions": info},
             "qfeat_src": qfeat_src,
             "qfeat_tgt": None,
@@ -244,6 +267,13 @@ class UniCorrn(nn.Module):
             "desc_tgt": desc_tgt,
             "gm_intermediates": gm_out,
         }
+        if frustum_query_pos_3d is not None:
+            output["frustum_predictions"], output["frustum_intermediates"] = (
+                self._frustum_pcd_to_img(
+                    tgt_point, src_feat, frustum_query_pos_3d, patch_coord_map
+                )
+            )
+        return output
 
     def forward_pcd_to_img(self, sample, tgt_img, query_pos_3d, query_pos_2d=None):
         B, C, H, W = tgt_img.shape
@@ -267,6 +297,7 @@ class UniCorrn(nn.Module):
             (
                 out_pcd2img,
                 info_pcd2img,
+                _,
                 qfeat_src,
                 desc_src,
                 desc_tgt,
@@ -307,7 +338,7 @@ class UniCorrn(nn.Module):
                 "desc_tgt": desc_tgt,
             }
 
-        out, info, qfeat_src, desc_src, desc_tgt, gm_out = (
+        out, info, frustum_out, qfeat_src, desc_src, desc_tgt, gm_out = (
             self.decoder.forward_pcd_to_img(
                 src_point.feat,
                 src_point,
@@ -318,7 +349,12 @@ class UniCorrn(nn.Module):
         )
 
         return {
-            "pcd2img": {"corr_predictions": out, "info_predictions": info},
+            "pcd2img": {
+                "corr_predictions": out,
+                "info_predictions": info,
+                "frustum_predictions": frustum_out[-1],
+                "frustum_intermediates": frustum_out,
+            },
             "qfeat_src": qfeat_src,
             "qfeat_tgt": None,
             "desc_src": desc_src,

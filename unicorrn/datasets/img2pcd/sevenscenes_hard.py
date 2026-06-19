@@ -23,6 +23,7 @@ from ...utils.vision3d.array_ops import (
     center_shift_corr_points
 )
 from .data_io import load_pickle, read_depth_image, read_image, get_transform
+from .frustum_labels import build_frustum_queries
 from ..img2img.dust3r.datasets.base import EasyDataset
 
 def _get_frame_name(filename):
@@ -52,6 +53,8 @@ class SevenScenes2D3DHardPairDataset(EasyDataset):
             new_resolution: Optional[Union[List[int], Tuple[int, int], int]] = None,
             return_overlap_indices: bool = False,
             normalize_points: bool = True,
+            return_frustum: bool = False,
+            num_frustum_queries: int = 1024,
     ):
         super().__init__()
 
@@ -87,6 +90,8 @@ class SevenScenes2D3DHardPairDataset(EasyDataset):
                                                                              int) else new_resolution
         self.return_overlap_indices = return_overlap_indices
         self.normalize_points = normalize_points
+        self.return_frustum = return_frustum
+        self.num_frustum_queries = num_frustum_queries
 
     def __len__(self):
         return len(self.metadata_list)
@@ -255,6 +260,16 @@ class SevenScenes2D3DHardPairDataset(EasyDataset):
 
         if self.normalize_points:
             norm_targets = normalize_coord_corr_points(targets, points)
+            if self.return_frustum:
+                if self.new_resolution is not None:
+                    fr_h, fr_w = self.new_resolution
+                else:
+                    fr_h, fr_w = data_dict['image_h'], data_dict['image_w']
+                frustum_queries, frustum_labels = build_frustum_queries(
+                    points, transform, intrinsics, fr_h, fr_w, self.num_frustum_queries
+                )
+                data_dict['frustum_queries'] = frustum_queries
+                data_dict['frustum_labels'] = frustum_labels
             points, points_norm_meta = normalize_coord(points, return_meta=True)
             data_dict['norm_targets'] = norm_targets
             data_dict['points_norm_meta'] = points_norm_meta

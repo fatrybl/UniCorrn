@@ -791,6 +791,8 @@ def train(cfg):
         else {}
     )
     feature_loss_fn = get_loss(cfg.FEATURE_LOSS)
+    frustum_loss_cfg = getattr(cfg, "FRUSTUM_LOSS", None)
+    frustum_loss_fn = get_loss(frustum_loss_cfg) if frustum_loss_cfg is not None else None
 
     # Prepare everything with `accelerator`.
     model, optimizer = accelerator.prepare(model, optimizer)
@@ -881,7 +883,7 @@ def train(cfg):
 
                 batch = move_to_device(batch, accelerator.device)
                 loss, loss_details = trainer.run_step(
-                    model, batch, matching_loss_fn, feature_loss_fn
+                    model, batch, matching_loss_fn, feature_loss_fn, frustum_loss_fn
                 )
                 # loss, loss_details = trainer.run_step(model, batch, loss_fn)
 

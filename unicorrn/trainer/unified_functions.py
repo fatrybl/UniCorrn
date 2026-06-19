@@ -1,7 +1,54 @@
+"""Loss functions for unified 2D-3D matching tasks.
+
+Registers per-task loss implementations into the shared ``loss_functions``
+registry used by the UniCorrn trainer. Includes the deep-supervised
+geometric frustum focal-BCE loss added by the frustum-head fork.
+"""
+
 import torch
 import torch.nn.functional as F
 
 from .functions import loss_functions, ConfidenceMatchingLoss, InfoNCE
+
+
+@loss_functions.register()
+class FrustumClassificationLoss:
+    """Deep-supervised focal BCE for geometric frustum membership.
+
+    Applies focal binary cross-entropy to every decoder-layer frustum readout,
+    weighting deeper layers more via an exponential decay (gamma), mirroring the
+    auxiliary matching supervision.
+
+        focal = (1 - p_t) ** focal_gamma,   loss = focal * BCE(logit, label)
+    """
+
+    def __init__(self, gamma=0.8, focal_gamma=2.0, pos_weight=1.0):
+        """Initialise decay, focal-loss exponent and positive-class BCE weight."""
+        self.gamma = gamma
+        self.focal_gamma = focal_gamma
+        self.pos_weight = pos_weight
+
+    def _focal_bce(self, logits, labels):
+        """Focal binary cross-entropy for a single prediction layer."""
+        pos_weight = torch.tensor(self.pos_weight, device=logits.device)
+        ce = F.binary_cross_entropy_with_logits(
+            logits, labels, reduction="none", pos_weight=pos_weight
+        )
+        p = torch.sigmoid(logits)
+        focal = (1 - torch.where(labels > 0.5, p, 1 - p)) ** self.focal_gamma
+        return (focal * ce).mean()
+
+    def __call__(self, frustum_intermediates, labels, **kwargs):
+        """Compute γ-decayed focal BCE over all decoder-layer frustum readouts."""
+        labels = labels.float()
+        num_layers = len(frustum_intermediates)
+        loss = 0.0
+        for idx in range(num_layers):
+            decay = self.gamma ** (num_layers - idx - 1)
+            loss = loss + decay * self._focal_bce(
+                frustum_intermediates[idx].squeeze(-1), labels
+            )
+        return loss, {"frustum_loss": loss.item() if torch.is_tensor(loss) else loss}
 
 
 class _GlobalMatchingLoss:

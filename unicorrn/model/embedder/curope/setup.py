@@ -14,7 +14,7 @@ all_cuda_archs = cuda.get_gencode_flags().replace('compute=','arch=').split()
     # '-gencode', 'arch=compute_80,code=sm_80',
     # '-gencode', 'arch=compute_86,code=sm_86'
 # ]
-all_cuda_archs = ['-gencode', 'arch=compute_80,code=sm_80']
+all_cuda_archs = ['-gencode', 'arch=compute_86,code=sm_86']
 
 setup(
     name = 'curope',
