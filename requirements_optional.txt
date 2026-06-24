@@ -1,0 +1,6 @@
+pillow-heif
+kapture
+kapture-localization
+numpy-quaternion
+pycolmap
+poselib

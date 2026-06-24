@@ -1,0 +1,97 @@
+NAME: UniCorrn
+IMG_SIZE: [ 512, 384 ]
+PATCH_SIZE: 16
+BIDIRECTIONAL: True
+IMG_POS_EMBED: "RoPE100"
+BACKBONE:
+  IMAGE:
+    NAME: CrocoV2_Encoder
+    DEPTH: 24
+    NUM_HEADS: 16
+    EMBED_DIM: 1024
+    MLP_RATIO: 4
+    QKV_BIAS: True
+    ACTIVATION: "gelu"
+    ATTN_DROP: 0.0
+    PROJ_DROP: 0.0
+    DROP_PATH: 0.
+    RETURN_INTERMEDIATE: False
+    USE_FLASH_ATTN: False
+  POINT_CLOUD:
+    NAME: PTv3_Encoder
+    IN_CHANNELS: 3
+    STRIDE: [ 2, 2 ]
+    ENC_DEPTHS: [ 3, 6, 6 ]
+    ENC_CHANNELS: [ 32, 128, 512 ]
+    ENC_NUM_HEADS: [ 2, 8, 32 ]
+    ENC_PATCH_SIZE: [ 1024, 1024, 1024 ]
+    PROJECT_DIM: False   # no feature output projection
+    MLP_RATIO: 4
+    QKV_BIAS: True
+    QK_SCALE: None
+    ATTN_DROP: 0.0
+    PROJ_DROP: 0.0
+    DROP_PATH: 0.3
+    PRE_NORM: True
+    SHUFFLE_ORDERS: True
+    ENABLE_RPE: False
+    ENABLE_FLASH: False
+    REPLACE_BN_NORM: True
+FEAT_ENCODER:
+  NAME: UnifiedFeatureEncoder
+  IMG_ENC_EMBED_DIM: 1024
+  PCD_ENC_EMBED_DIM: 512
+  DEC_EMBED_DIM: 768
+  DEC_DEPTH: 12
+  NUM_HEADS: 16
+  MLP_RATIO: 4
+  QKV_BIAS: True
+  ACTIVATION: "gelu"
+  POINT_ORDER: [ "z", "z-trans", "hilbert", "hilbert-trans" ]
+  MODAL_NORM: True
+  NORM_MEM: True
+  FUSION_ATTN_DROP: 0.0
+  PROJ_DROP: 0.0
+  DROP_PATH: 0.0
+  POINT_CLOUD_PATCH_SIZE: 1024
+  IMG_UPSAMPLER:
+    NAME: CatMLPUpsampler2D
+    BBONE_CHANNEL: 1024
+    ENC_CHANNEL: 768
+    UPSCALE_FACTOR: 4
+    DEC_CHANNEL: 512
+    MLP_RATIO: 4
+  PCD_UPSAMPLER:
+    NAME: PTv3Upsampler3D
+    BBONE_DIMS: [ 128 ]
+    ENC_EMBED_DIM: 768
+    DEC_DIMS: [ 512 ]
+    DEC_DEPTHS: [ 3 ]
+    NUM_HEADS: [ 32 ]
+    PATCH_SIZE: [ 1024 ]
+    POINT_ORDER: [ "z", "z-trans", "hilbert", "hilbert-trans" ]
+    MLP_RATIO: 4
+    QKV_BIAS: True
+    QK_SCALE: None
+    ATTN_DROP: 0.0
+    PROJ_DROP: 0.0
+    DROP_PATH: 0.3
+    PRE_NORM: True
+    ENABLE_RPE: False
+DECODER:
+  NAME: QueryMatchingDecoder
+  DEC_EMBED_DIM: 512
+  POS_EMBED_DIM: 256
+  DEC_DEPTH: 8
+  NUM_HEADS: 1
+  MLP_RATIO: 4
+  QKV_BIAS: True
+  ACTIVATION: "gelu"
+  POINT_ORDER: [ "z", "z-trans", "hilbert", "hilbert-trans" ]
+  NORM_MEM: True
+  K: 4
+  FUSION_ATTN_DROP: 0.0
+  QUERY_CROSS_ATTN_DROP: 0.0
+  PROJ_DROP: 0.0
+  DROP_PATH: 0.0
+  LAST_LAYER_RES_ONLY: False

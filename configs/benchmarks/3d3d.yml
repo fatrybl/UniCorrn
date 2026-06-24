@@ -1,0 +1,18 @@
+NORMALIZE_POINTS: True
+DATASET:
+  3DMatch:
+    ROOT: /your_project_path/data/Datasets/indoor
+    TEST_3DMATCH_META_DATA: /your_project_path/data/metadata/3dmatch_test_3DMatch_info.pkl
+    TEST_3DLOMATCH_META_DATA: /your_project_path/data/metadata/3dmatch_test_3DLoMatch_info.pkl
+    GRID_SIZE: 0.02
+    MATCHING_RADIUS_3D: 0.0375
+    DOWNSAMPLE_VOXEL_SIZE: null
+    AUGMENTATION_NOISE: 0.005
+  ModelNet:
+    ROOT: /your_project_path/data/Datasets/modelnet40_ply_hdf5_2048
+    TEST_MODELNET_META_DATA: /your_project_path/data/metadata/modelnet_test_files.txt
+    TEST_CATEGORIES: /your_project_path/data/metadata/modelnet40_half2.txt
+    GRID_SIZE: 0.02
+    MATCHING_RADIUS_3D: 0.0375
+    DOWNSAMPLE_VOXEL_SIZE: null
+    AUGMENTATION_NOISE: 0.005

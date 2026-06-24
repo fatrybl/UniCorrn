@@ -1,0 +1,255 @@
+NAME: trainer_large_2d_3d
+SUFFIX: stage_1
+TRAINER:
+  NAME: unified_trainer
+  PARAMS:
+    img2img_wt: 1.0 # set to 0.0 to disable task
+    img2pcd_wt: 0.0 # set to 0.0 to disable task
+    pcd2pcd_wt: 1.0 # set to 0.0 to disable task
+DATASET:
+  BIDIRECTIONAL: True
+  MAX_QUERIES: 1024
+  TRAIN_DATA_RES: [ 512, 384 ]
+  VAL_DATA_RES: [ 512, 384 ]
+  2D3D_SAMPLES: 0 # Disable oversampling
+  3D3D_SAMPLES: 0
+  TRAIN_DATA:
+    IMG2IMG:
+      BlendedMVS:
+        PATH: 'data/Datasets/blendedmvs_processed'
+        SAMPLE_COUNT: 68_400
+        PARAMS:
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: True
+          load_img2pcd: False
+          load_pcd2pcd: False
+      MegaDepth:
+        PATH: 'data/Datasets/megadepth_processed'
+        SAMPLE_COUNT: 68_400
+        PARAMS:
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: True
+          load_img2pcd: False
+          load_pcd2pcd: False
+      ARKitScenes:
+        PATH: 'data/Datasets/arkitscenes_processed'
+        SAMPLE_COUNT: 45_600
+        PARAMS:
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: True
+          load_img2pcd: False
+          load_pcd2pcd: False
+      Co3d:
+        PATH: 'data/Datasets/co3d_processed'
+        SAMPLE_COUNT: 22_800
+        PARAMS:
+          mask_bg: 'rand'
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: True
+          load_img2pcd: False
+          load_pcd2pcd: False
+      StaticThings3D:
+        PATH: 'data/Datasets/staticthings3d_processed'
+        SAMPLE_COUNT: 22_800
+        PARAMS:
+          mask_bg: 'rand'
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: True
+          load_img2pcd: False
+          load_pcd2pcd: False
+      ScanNetpp:
+        PATH: 'data/Datasets/scannetpp_processed'
+        SAMPLE_COUNT: 60_000
+        PARAMS:
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: True
+          load_img2pcd: False
+          load_pcd2pcd: False
+      Waymo:
+        PATH: 'data/Datasets/waymo_processed'
+        SAMPLE_COUNT: 60_000
+        PARAMS:
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: True
+          load_img2pcd: False
+          load_pcd2pcd: False
+    IMG2PCD:
+      7Scenes:
+        PATH: 'data/Datasets/7Scenes'
+        PARAMS:
+          grid_size: 0.02
+          max_points: 30000
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          overlap_threshold: 0.5
+          use_augmentation: True
+          normalize_points: True
+    PCD2PCD:
+      MegaDepth:
+        PATH: 'data/Datasets/megadepth_processed'
+        SAMPLE_COUNT: 80_000
+        PARAMS:
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: False
+          load_img2pcd: False
+          load_pcd2pcd: True
+      ARKitScenes:
+        PATH: 'data/Datasets/arkitscenes_processed'
+        SAMPLE_COUNT: 80_000
+        PARAMS:
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: False
+          load_img2pcd: False
+          load_pcd2pcd: True
+      ScanNetpp:
+        PATH: 'data/Datasets/scannetpp_processed'
+        SAMPLE_COUNT: 80_000
+        PARAMS:
+          max_points: 30_000
+          pcd_max_rotation: 45
+          pcd_max_translation: 0.2
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          load_img2img: False
+          load_img2pcd: False
+          load_pcd2pcd: True
+      3DMatch:
+        PATH: 'data/Datasets/indoor'
+        PARAMS:
+          meta_data: 'data/metadata/3dmatch_train_info.pkl'
+          max_points: 30000
+          grid_size: 0.02
+          matching_radius_3d: 0.0375
+          use_augmentation: True
+          augmentation_noise: 0.005
+          normalize_points: True
+      ModelNet:
+        PATH: 'data/Datasets/modelnet40_ply_hdf5_2048'
+        PARAMS:
+          meta_data: 'data/metadata/modelnet_train_files.txt'
+          category_file: 'data/metadata/modelnet40_half1.txt'
+          grid_size: 0.02
+          matching_radius_3d: 0.0375
+          use_augmentation: True
+          augmentation_noise: 0.005
+          normalize_points: True
+  VAL_DATA:
+    IMG2IMG:
+      MegaDepth:
+        PATH: 'data/Datasets/megadepth_processed'
+        SAMPLE_COUNT: 1200
+        PARAMS:
+          load_img2img: True
+          load_img2pcd: False
+          load_pcd2pcd: False
+    IMG2PCD:
+      7Scenes:
+        PATH: 'data/Datasets/7Scenes'
+        PARAMS:
+          grid_size: 0.02
+          matching_radius_2d: 8.0
+          matching_radius_3d: 0.0375
+          overlap_threshold: 0.5
+          use_augmentation: False
+          normalize_points: True
+    PCD2PCD:
+      3DMatch:
+        PATH: 'data/Datasets/indoor'
+        SAMPLE_COUNT: 1200
+        PARAMS:
+          meta_data: 'data/metadata/3dmatch_val_info.pkl'
+          grid_size: 0.02
+          matching_radius_3d: 0.0375
+          use_augmentation: False
+          normalize_points: True
+MATCHING_LOSS:
+  NAME: AuxiliaryGlobalMatchingLoss
+  PARAMS:
+    reg_loss: 'l1'
+    gamma: 0.8
+    alpha: 0.2
+    vmin: 1
+FEATURE_LOSS:
+  NAME: UnifiedInfoNCELoss
+  PARAMS:
+    info_nce_wt: 0.05
+    temperature: 0.05
+    mode: 'proper'
+    use_euclidean_dist: True
+    enable_query2tgt: True
+    enable_query2src: False
+BATCH_SIZE: 6
+GRADIENT_ACCUMULATION_STEPS: 1
+NUM_WORKERS: 8
+MAX_ITERS: 2_000_000_000
+EPOCHS: 40
+MIXED_PRECISION: None
+SEED: 0
+OPTIMIZER:
+  NAME: AdamW
+  LR: 0.0001
+  PARAMS:
+    betas: [ 0.9, 0.95 ]
+    weight_decay: 0.01
+SCHEDULER:
+  USE: True
+  LR: 0.0001
+  MIN_LR: 0.0000001
+  WARMUP_EPOCHS: 4
+OUTPUT_DIR: './output/v0'
+LOG_INTERVAL: 100
+VALIDATE_INTERVAL: 1000
+CKPT_INTERVAL: 1000
+PRETRAINED_CROCO_PATH: None
+PRETRAINED_PTv3_PATH: None
+FREEZE_CROCO_ENCODER: False
+FREEZE_CROCO_DECODER: False
+RESUME:
+  CKPT_PATH: None
+  STEP: 0
