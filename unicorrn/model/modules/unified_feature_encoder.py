@@ -2,12 +2,25 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from ...utils import cartesian_img_coord
 from ...utils.config import configurable
 from ..blocks import MMDecoderBlockBidirectional
 from ..blocks.utils import freeze_modules
 from .build import DECODER_REGISTRY, build_decoder
+
+
+def _ckpt(training, fn, *args):
+    """Gradient-checkpoint ``fn(*args)`` during training (recompute in backward, save mem).
+
+    Skips when not training, grad is disabled, or no input needs grad (frozen stage),
+    so inference and frozen-encoder training are unaffected.
+    """
+    needs_grad = any(torch.is_tensor(a) and a.requires_grad for a in args)
+    if training and torch.is_grad_enabled() and needs_grad:
+        return checkpoint(fn, *args, use_reentrant=False)
+    return fn(*args)
 
 
 @DECODER_REGISTRY.register()
@@ -134,8 +147,9 @@ class UnifiedFeatureEncoder(nn.Module):
             .view(_b, -1, 2)
         )
         for block in self.dec_blocks:
-            src_feat_dec, tgt_feat_dec = block.forward_img_to_img(
-                src_feat_dec, tgt_feat_dec, patch_coord_map, patch_coord_map
+            src_feat_dec, tgt_feat_dec = _ckpt(
+                self.training, block.forward_img_to_img,
+                src_feat_dec, tgt_feat_dec, patch_coord_map, patch_coord_map,
             )
         src_feat_dec = self.dec_norm(src_feat_dec)
         tgt_feat_dec = self.dec_norm(tgt_feat_dec)
@@ -188,8 +202,9 @@ class UnifiedFeatureEncoder(nn.Module):
             .view(_b, -1, 2)
         )
         for block in self.dec_blocks:
-            src_feat_dec, tgt_feat_dec = block.forward_img_to_pcd(
-                src_feat_dec, tgt_feat_dec, patch_coord_map, tgt_point
+            src_feat_dec, tgt_feat_dec = _ckpt(
+                self.training, block.forward_img_to_pcd,
+                src_feat_dec, tgt_feat_dec, patch_coord_map, tgt_point,
             )
         src_feat_dec = self.dec_norm(src_feat_dec)
         tgt_feat_dec = self.dec_norm(tgt_feat_dec)
@@ -242,8 +257,9 @@ class UnifiedFeatureEncoder(nn.Module):
             .view(_b, -1, 2)
         )
         for block in self.dec_blocks:
-            src_feat_dec, tgt_feat_dec = block.forward_pcd_to_img(
-                src_feat_dec, tgt_feat_dec, src_point, patch_coord_map
+            src_feat_dec, tgt_feat_dec = _ckpt(
+                self.training, block.forward_pcd_to_img,
+                src_feat_dec, tgt_feat_dec, src_point, patch_coord_map,
             )
         src_feat_dec = self.dec_norm(src_feat_dec)
         tgt_feat_dec = self.dec_norm(tgt_feat_dec)
@@ -279,8 +295,9 @@ class UnifiedFeatureEncoder(nn.Module):
         tgt_feat_dec = self.decoder_embed_pcd(tgt_point.feat)
 
         for block in self.dec_blocks:
-            src_feat_dec, tgt_feat_dec = block.forward_pcd_to_pcd(
-                src_feat_dec, tgt_feat_dec, src_point, tgt_point
+            src_feat_dec, tgt_feat_dec = _ckpt(
+                self.training, block.forward_pcd_to_pcd,
+                src_feat_dec, tgt_feat_dec, src_point, tgt_point,
             )
         src_feat_dec = self.dec_norm(src_feat_dec)
         tgt_feat_dec = self.dec_norm(tgt_feat_dec)

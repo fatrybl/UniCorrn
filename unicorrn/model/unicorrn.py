@@ -275,7 +275,9 @@ class UniCorrn(nn.Module):
             )
         return output
 
-    def forward_pcd_to_img(self, sample, tgt_img, query_pos_3d, query_pos_2d=None):
+    def forward_pcd_to_img(
+        self, sample, tgt_img, query_pos_3d, query_pos_2d=None, cached_img_feat=None
+    ):
         B, C, H, W = tgt_img.shape
 
         src_point = {
@@ -287,7 +289,7 @@ class UniCorrn(nn.Module):
             ),
         }
         src_point = self.pcd_encoder(src_point)
-        tgt_feat = self._encode_img(tgt_img)
+        tgt_feat = self._encode_img(tgt_img) if cached_img_feat is None else cached_img_feat
 
         (src_point, tgt_feat, patch_shape, patch_coord_map) = (
             self.feat_encoder.forward_pcd_to_img(src_point, tgt_feat, img_H=H, img_W=W)

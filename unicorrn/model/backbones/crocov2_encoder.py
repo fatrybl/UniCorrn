@@ -9,6 +9,7 @@
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from functools import partial
 
@@ -106,16 +107,17 @@ class CrocoV2_Encoder(nn.Module):
             posvis = pos
 
         # now apply the transformer encoder and normalization        
+        ckpt = self.training and torch.is_grad_enabled() and x.requires_grad
         if return_all_blocks:
             out = []
             for blk in self.enc_blocks:
-                x = blk(x, posvis)
+                x = checkpoint(blk, x, posvis, use_reentrant=False) if ckpt else blk(x, posvis)
                 out.append(x)
             out[-1] = self.enc_norm(out[-1])
             return out, pos, masks
         else:
             for blk in self.enc_blocks:
-                x = blk(x, posvis)
+                x = checkpoint(blk, x, posvis, use_reentrant=False) if ckpt else blk(x, posvis)
             x = self.enc_norm(x)
             return x, pos, masks
 

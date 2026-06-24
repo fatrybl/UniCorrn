@@ -13,12 +13,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.checkpoint import checkpoint
 
 from ...utils.config import configurable
 from ..blocks import DualStreamQueryDecoderBlock, FrustumHead, GaussianKNNSample, Mlp
 from ..blocks.utils import freeze_modules, offset2batch
 from ..embedder import InvertibleLinearPositionEmbedding
 from .build import DECODER_REGISTRY
+
+
+def _declone(x):
+    """Clone inference-mode tensors so checkpoint can save them for backward."""
+    return x.clone() if torch.is_tensor(x) and torch.is_inference(x) else x
+
+
+def _ckpt(training, fn, *args, **kwargs):
+    """Gradient-checkpoint ``fn`` during training (recompute in backward, save memory)."""
+    needs_grad = any(torch.is_tensor(a) and a.requires_grad for a in args)
+    if not (training and torch.is_grad_enabled() and needs_grad):
+        return fn(*args, **kwargs)
+    args = tuple(_declone(a) for a in args)
+    kwargs = {k: _declone(v) for k, v in kwargs.items()}
+    return checkpoint(fn, *args, use_reentrant=False, **kwargs)
 
 
 @DECODER_REGISTRY.register()
@@ -194,7 +210,9 @@ class QueryMatchingDecoder(nn.Module):
             ):
                 gm_res_ = gm_res
 
-            ret = block.forward_query_to_img(
+            ret = _ckpt(
+                self.training,
+                block.forward_query_to_img,
                 q,
                 mem,
                 patch_coord_map,
@@ -257,7 +275,9 @@ class QueryMatchingDecoder(nn.Module):
             ):
                 gm_res_ = gm_res
 
-            ret = block.forward_query_to_pcd(
+            ret = _ckpt(
+                self.training,
+                block.forward_query_to_pcd,
                 q,
                 mem,
                 tgt_point.coord,
@@ -325,7 +345,9 @@ class QueryMatchingDecoder(nn.Module):
             ):
                 gm_res_ = gm_res
 
-            ret = block.forward_query_to_img(
+            ret = _ckpt(
+                self.training,
+                block.forward_query_to_img,
                 q,
                 mem,
                 patch_coord_map,
@@ -388,7 +410,9 @@ class QueryMatchingDecoder(nn.Module):
             ):
                 gm_res_ = gm_res
 
-            ret = block.forward_query_to_pcd(
+            ret = _ckpt(
+                self.training,
+                block.forward_query_to_pcd,
                 q,
                 mem,
                 tgt_point.coord,
