@@ -19,6 +19,23 @@ def array_to_tensor(x):
     return x
 
 
+def concat_point_feats(feats_list, points_list):
+    """Concatenate per-sample [xyz, extra-channel] feature arrays.
+
+    Samples without extra channels (None entries) are padded with zeros so that
+    mixed batches stay well-defined: a zero extra channel carries no signal and,
+    with zero-initialized new input weights, reproduces the xyz-only computation.
+    """
+    feat_dim = next(f.shape[1] for f in feats_list if f is not None)
+    feats_list = [
+        f if f is not None else np.concatenate(
+            [p, np.zeros((p.shape[0], feat_dim - p.shape[1]), dtype=p.dtype)], axis=1
+        )
+        for f, p in zip(feats_list, points_list)
+    ]
+    return np.concatenate(feats_list, axis=0)
+
+
 def collate_dict(data_dicts: List[dict]) -> dict:
     """Collate a batch of dict.
 
@@ -63,6 +80,10 @@ class PointCloudRegistrationCollateFn(Callable):
             collated_dict["tgt_pcd"] = np.concatenate(tgt_points_list, axis=0)
             collated_dict["src_length"] = np.asarray([points.shape[0] for points in src_points_list])
             collated_dict["tgt_length"] = np.asarray([points.shape[0] for points in tgt_points_list])
+            if "src_feats" in collated_dict:
+                collated_dict["src_feats"] = concat_point_feats(collated_dict.pop("src_feats"), src_points_list)
+            if "tgt_feats" in collated_dict:
+                collated_dict["tgt_feats"] = concat_point_feats(collated_dict.pop("tgt_feats"), tgt_points_list)
 
             # additional attributes
             collated_dict["src_grid_coord"] = np.concatenate(collated_dict.pop("src_grid_coord"), axis=0)
@@ -174,11 +195,13 @@ class ImageToPointRegistrationCollateFn(Callable):
             points_list = collated_dict.pop("points")
             collated_dict["points"] = np.concatenate(points_list, axis=0)
             collated_dict["lengths"] = np.asarray([points.shape[0] for points in points_list])
+            if "feats" in collated_dict:
+                collated_dict["feats"] = concat_point_feats(collated_dict.pop("feats"), points_list)
             collated_dict["intrinsics"] = np.stack(collated_dict.pop("intrinsics"), axis=0)  # (B, 3, 3)
 
             # additional attributes
             collated_dict["grid_coord"] = np.concatenate(collated_dict.pop("grid_coord"), axis=0)
-            
+
         collated_dict["image"] = image
         collated_dict["depth"] = depth
 
@@ -288,11 +311,13 @@ class JointTrainingCollateFn(Callable):
             points_list = collated_dict.pop("points")
             collated_dict["points"] = np.concatenate(points_list, axis=0)
             collated_dict["lengths"] = np.asarray([points.shape[0] for points in points_list])
+            if "feats" in collated_dict:
+                collated_dict["feats"] = concat_point_feats(collated_dict.pop("feats"), points_list)
             collated_dict["intrinsics"] = np.stack(collated_dict.pop("intrinsics"), axis=0)  # (B, 3, 3)
 
             # additional attributes
             collated_dict["grid_coord"] = np.concatenate(collated_dict.pop("grid_coord"), axis=0)
-            
+
         collated_dict["image"] = image
         collated_dict["depth"] = depth
         collated_dict["batch_size"] = batch_size
@@ -338,6 +363,10 @@ class JointTrainingCollateFn(Callable):
             collated_dict["tgt_pcd"] = np.concatenate(tgt_points_list, axis=0)
             collated_dict["src_length"] = np.asarray([points.shape[0] for points in src_points_list])
             collated_dict["tgt_length"] = np.asarray([points.shape[0] for points in tgt_points_list])
+            if "src_feats" in collated_dict:
+                collated_dict["src_feats"] = concat_point_feats(collated_dict.pop("src_feats"), src_points_list)
+            if "tgt_feats" in collated_dict:
+                collated_dict["tgt_feats"] = concat_point_feats(collated_dict.pop("tgt_feats"), tgt_points_list)
 
             # additional attributes
             collated_dict["src_grid_coord"] = np.concatenate(collated_dict.pop("src_grid_coord"), axis=0)
@@ -353,7 +382,7 @@ class JointTrainingCollateFn(Callable):
 
         # 2. array to tensor
         collated_dict = array_to_tensor(collated_dict)
-        return collated_dict        
+        return collated_dict
 
     def __call__(self, data_dicts: List[dict]):
         batch = {}

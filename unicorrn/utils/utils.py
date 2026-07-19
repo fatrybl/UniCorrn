@@ -191,7 +191,36 @@ def np_img_to_torch_img(np_img):
         raise ValueError('cannot process this image with shape: {0}'.format(np_img.shape))
 
 
+def expand_grown_input_channels(model, saved_weights):
+    """Zero-pad checkpoint tensors whose input-channel dim is smaller than the
+    model's (e.g. a stem trained on xyz loaded into an xyz+intensity model).
+
+    Appending zero columns is exactly function-preserving: W_new = [W_old | 0]
+    gives W_new @ [x; i] = W_old @ x for any value of the new channels, so the
+    loaded model reproduces the pretrained one and learns the new channels
+    from zero. Only tensors differing in a single, grown dimension are padded.
+    """
+    model_dict = model.state_dict()
+    saved_weights = dict(saved_weights)
+    for key, w in saved_weights.items():
+        for k in (key, key.replace('module.', ''), 'module.' + key):
+            if k in model_dict:
+                tgt = model_dict[k]
+                break
+        else:
+            continue
+        if not torch.is_tensor(w) or w.ndim != tgt.ndim or w.shape == tgt.shape:
+            continue
+        diff = [d for d in range(w.ndim) if w.shape[d] != tgt.shape[d]]
+        if len(diff) == 1 and w.shape[diff[0]] < tgt.shape[diff[0]]:
+            pad_shape = list(w.shape)
+            pad_shape[diff[0]] = tgt.shape[diff[0]] - w.shape[diff[0]]
+            saved_weights[key] = torch.cat([w, w.new_zeros(pad_shape)], dim=diff[0])
+    return saved_weights
+
+
 def safe_load_weights(model, saved_weights):
+    saved_weights = expand_grown_input_channels(model, saved_weights)
     try:
         model.load_state_dict(saved_weights)
     except RuntimeError:
