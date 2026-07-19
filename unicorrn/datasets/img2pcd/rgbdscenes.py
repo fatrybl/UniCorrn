@@ -133,11 +133,14 @@ class RGBDScenes2D3DHardPairDataset(EasyDataset):
         data_dict["image_w"] = image.shape[1]
         image = torch.from_numpy(image).permute(2, 0, 1)
 
-        # read points
+        # read points; extra channels beyond xyz (e.g. intensity) are split off
+        # and kept aligned, since all geometry below is xyz-only
         points = np.load(osp.join(self.data_dir, metadata["cloud_file"]))
+        points, extra_feats = points[:, :3], points[:, 3:]
         if self.max_points is not None and points.shape[0] > self.max_points:
             sel_indices = np.random.permutation(points.shape[0])[: self.max_points]
             points = points[sel_indices]
+            extra_feats = extra_feats[sel_indices]
 
         if self.use_augmentation:
             # augment point cloud
@@ -214,6 +217,8 @@ class RGBDScenes2D3DHardPairDataset(EasyDataset):
         data_dict['image'] = image.astype(np.float32)
         data_dict['depth'] = depth.astype(np.float32)
         data_dict['points'] = points.astype(np.float32)
+        if extra_feats.shape[1] > 0:
+            data_dict['feats'] = np.concatenate([points, extra_feats], axis=1).astype(np.float32)
         data_dict['grid_coord'] = grid_sample['grid_coord']
         data_dict['min_grid_coord'] = grid_sample['min_coord']
         data_dict['dataset'] = "RGBDScenesV2"

@@ -16,6 +16,7 @@ class PTv3_Encoder(PointTransformerV3):
     def __init__(
         self,
         in_channels=3,
+        feat_channels=3,
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
@@ -77,8 +78,10 @@ class PTv3_Encoder(PointTransformerV3):
         self.input_project = nn.Identity()
         self.project = nn.Identity()
 
-        if in_channels > 3:
-            self.input_project = nn.Linear(3, in_channels, bias=False)
+        # feat_channels is the dimension of pcd["feat"] (e.g. 3 for xyz, 4 for
+        # xyz+intensity); the stem consumes in_channels
+        if in_channels != feat_channels:
+            self.input_project = nn.Linear(feat_channels, in_channels, bias=False)
 
         if project_dim and project_dim != -1:
             self.project = nn.Linear(enc_channels[-1], project_dim, bias=False)
@@ -87,6 +90,7 @@ class PTv3_Encoder(PointTransformerV3):
     def from_config(cls, cfg):
         return {
             "in_channels": cfg.IN_CHANNELS,
+            "feat_channels": cfg.get("FEAT_CHANNELS", 3),
             "stride": cfg.STRIDE,
             "enc_depths": cfg.ENC_DEPTHS,
             "enc_channels": cfg.ENC_CHANNELS,
@@ -239,6 +243,7 @@ class PTv3_EncoderV3(PointTransformerV3):
     def __init__(
         self,
         in_channels=3,
+        feat_channels=3,
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
@@ -304,8 +309,10 @@ class PTv3_EncoderV3(PointTransformerV3):
         self.input_project = nn.Identity()
         self.project = nn.Identity()
 
-        if in_channels > 3:
-            layers = [nn.Linear(3, in_channels, bias=enable_input_bias)]
+        # feat_channels is the dimension of pcd["feat"] (e.g. 3 for xyz, 4 for
+        # xyz+intensity); the stem consumes in_channels
+        if in_channels != feat_channels:
+            layers = [nn.Linear(feat_channels, in_channels, bias=enable_input_bias)]
             if enable_input_relu:
                 layers.append(nn.ReLU())
 
@@ -322,6 +329,7 @@ class PTv3_EncoderV3(PointTransformerV3):
     def from_config(cls, cfg):
         return {
             "in_channels": cfg.IN_CHANNELS,
+            "feat_channels": cfg.get("FEAT_CHANNELS", 3),
             "stride": cfg.STRIDE,
             "enc_depths": cfg.ENC_DEPTHS,
             "enc_channels": cfg.ENC_CHANNELS,

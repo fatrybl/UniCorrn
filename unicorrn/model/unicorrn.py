@@ -185,7 +185,7 @@ class UniCorrn(nn.Module):
         B, C, H, W = src_img.shape
 
         tgt_point = {
-            "feat": sample["points"],
+            "feat": sample.get("feats", sample["points"]),
             "coord": sample["points"],
             "grid_coord": sample["grid_coord"].int(),
             "offset": torch.cumsum(sample["lengths"], dim=0).to(
@@ -281,7 +281,7 @@ class UniCorrn(nn.Module):
         B, C, H, W = tgt_img.shape
 
         src_point = {
-            "feat": sample["points"],
+            "feat": sample.get("feats", sample["points"]),
             "coord": sample["points"],
             "grid_coord": sample["grid_coord"].int(),
             "offset": torch.cumsum(sample["lengths"], dim=0).to(
@@ -366,7 +366,7 @@ class UniCorrn(nn.Module):
 
     def forward_pcd_to_pcd(self, sample, query_pos):
         src_point = {
-            "feat": sample["src_pcd"],
+            "feat": sample.get("src_feats", sample["src_pcd"]),
             "coord": sample["src_pcd"],
             "grid_coord": sample["src_grid_coord"].int(),
             "offset": torch.cumsum(sample["src_length"], dim=0).to(
@@ -374,7 +374,7 @@ class UniCorrn(nn.Module):
             ),
         }
         tgt_point = {
-            "feat": sample["tgt_pcd"],
+            "feat": sample.get("tgt_feats", sample["tgt_pcd"]),
             "coord": sample["tgt_pcd"],
             "grid_coord": sample["tgt_grid_coord"].int(),
             "offset": torch.cumsum(sample["tgt_length"], dim=0).to(

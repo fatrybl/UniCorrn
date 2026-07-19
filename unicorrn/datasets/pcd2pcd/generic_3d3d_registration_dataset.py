@@ -112,10 +112,29 @@ class Generic3D3DRegistrationDataset(EasyDataset):
 
         return pcd, aug_transform
 
+    @staticmethod
+    def _voxel_down_sample_indices(points, voxel_size):
+        """Keep one point per voxel, returning indices so that extra per-point
+        channels stay aligned with the surviving points."""
+        voxels = np.floor(points / voxel_size).astype(np.int64)
+        _, indices = np.unique(voxels, axis=0, return_index=True)
+        return indices
+
     def construct_data_dict(self, src_pcd, tgt_pcd, tgt2src_transform):
+        # extra channels beyond xyz (e.g. intensity) are split off and kept
+        # aligned, since all geometry below is xyz-only
+        src_pcd, src_feats = src_pcd[:, :3], src_pcd[:, 3:]
+        tgt_pcd, tgt_feats = tgt_pcd[:, :3], tgt_pcd[:, 3:]
+
         if self.downsample_voxel_size is not None:
-            src_pcd = voxel_down_sample(src_pcd, self.downsample_voxel_size)
-            tgt_pcd = voxel_down_sample(tgt_pcd, self.downsample_voxel_size)
+            if src_feats.shape[1] > 0 or tgt_feats.shape[1] > 0:
+                src_sel = self._voxel_down_sample_indices(src_pcd, self.downsample_voxel_size)
+                tgt_sel = self._voxel_down_sample_indices(tgt_pcd, self.downsample_voxel_size)
+                src_pcd, src_feats = src_pcd[src_sel], src_feats[src_sel]
+                tgt_pcd, tgt_feats = tgt_pcd[tgt_sel], tgt_feats[tgt_sel]
+            else:
+                src_pcd = voxel_down_sample(src_pcd, self.downsample_voxel_size)
+                tgt_pcd = voxel_down_sample(tgt_pcd, self.downsample_voxel_size)
 
         # Corresponding queries and targets should still be valid even when points are filtered out
         # queries, targets = get_3d3d_correspondences_mutual(src_pcd, tgt_pcd, tgt2src_transform,
@@ -126,10 +145,12 @@ class Generic3D3DRegistrationDataset(EasyDataset):
             if src_pcd.shape[0] > self.max_points:
                 selected = np.random.choice(src_pcd.shape[0], self.max_points)
                 src_pcd = src_pcd[selected]
+                src_feats = src_feats[selected]
 
             if tgt_pcd.shape[0] > self.max_points:
                 selected = np.random.choice(tgt_pcd.shape[0], self.max_points)
                 tgt_pcd = tgt_pcd[selected]
+                tgt_feats = tgt_feats[selected]
 
         queries, targets, query_indices, target_indices = get_3d3d_correspondences_mutual(src_pcd,
                                                                                           tgt_pcd,
@@ -185,6 +206,11 @@ class Generic3D3DRegistrationDataset(EasyDataset):
             'tgt_grid_coord': tgt_grid_sample['grid_coord'],
             'min_tgt_grid_coord': tgt_grid_sample['min_coord']
         }
+
+        if src_feats.shape[1] > 0:
+            data_dict['src_feats'] = np.concatenate([src_pcd, src_feats], axis=1).astype(np.float32)
+        if tgt_feats.shape[1] > 0:
+            data_dict['tgt_feats'] = np.concatenate([tgt_pcd, tgt_feats], axis=1).astype(np.float32)
 
         if self.bidirectional:
             queries = data_dict.pop('queries')

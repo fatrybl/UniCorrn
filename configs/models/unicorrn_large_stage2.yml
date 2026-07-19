@@ -19,7 +19,8 @@ BACKBONE:
     USE_FLASH_ATTN: False
   POINT_CLOUD:
     NAME: PTv3_Encoder
-    IN_CHANNELS: 3
+    IN_CHANNELS: 4    # stem input dim
+    FEAT_CHANNELS: 4  # dim of pcd["feat"]: xyz + intensity
     STRIDE: [ 2, 2 ]
     ENC_DEPTHS: [ 3, 6, 6 ]
     ENC_CHANNELS: [ 32, 128, 512 ]
