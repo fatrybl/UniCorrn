@@ -569,7 +569,12 @@ class SerializedAttentionRoPE(SerializedAttention):
         else:
             q, k, v = qkv.reshape(-1, 3, H, C // H).permute(1, 2, 0, 3).chunk(3, dim=0)
 
-        pos = self.get_pos(point, order).reshape(-1, K, 3)
+        # the flash branch keeps qkv flat as (1, H, N, C'), so the rotary
+        # positions must stay flat too instead of being split into patches
+        if not self.enable_flash:
+            pos = self.get_pos(point, order).reshape(-1, K, 3)
+        else:
+            pos = self.get_pos(point, order).reshape(1, -1, 3)
 
         # print('rope', q.shape, k.shape, v.shape)
         # apply Rotary Position Embedding
@@ -1036,6 +1041,7 @@ class PointTransformerV3(PointModule):
                         stride=stride[s - 1],
                         norm_layer=ln_layer if replace_bn_norm else bn_layer,
                         act_layer=act_layer,
+                        shuffle_orders=shuffle_orders,
                     ),
                     name="down",
                 )

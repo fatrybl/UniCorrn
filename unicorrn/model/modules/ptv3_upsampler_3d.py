@@ -5,7 +5,7 @@ from functools import partial
 
 from .build import DECODER_REGISTRY
 from ..blocks.point_transformer_v3 import PointSequential, SerializedUnpooling, Block
-from ...utils.config import configurable
+from ...utils.config import configurable, optional_float
 
 
 @DECODER_REGISTRY.register()
@@ -96,7 +96,7 @@ class PTv3Upsampler3D(nn.Module):
             'order': cfg.POINT_ORDER,
             'mlp_ratio': cfg.MLP_RATIO,
             'qkv_bias': cfg.QKV_BIAS,
-            'qk_scale': cfg.QK_SCALE,
+            'qk_scale': optional_float(cfg.QK_SCALE),
             'attn_drop': cfg.ATTN_DROP,
             'proj_drop': cfg.PROJ_DROP,
             'drop_path': cfg.DROP_PATH,

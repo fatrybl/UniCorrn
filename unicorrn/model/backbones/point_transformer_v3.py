@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from ...utils.config import configurable
+from ...utils.config import configurable, optional_float
 from ..blocks import PointTransformerV3
 from .build import ENCODER_REGISTRY
 
@@ -98,7 +98,7 @@ class PTv3_Encoder(PointTransformerV3):
             "enc_patch_size": cfg.ENC_PATCH_SIZE,
             "mlp_ratio": cfg.MLP_RATIO,
             "qkv_bias": cfg.QKV_BIAS,
-            "qk_scale": cfg.QK_SCALE,
+            "qk_scale": optional_float(cfg.QK_SCALE),
             "attn_drop": cfg.ATTN_DROP,
             "proj_drop": cfg.PROJ_DROP,
             "drop_path": cfg.DROP_PATH,
@@ -212,7 +212,7 @@ class PTv3_EncoderV2(PointTransformerV3):
             "dec_patch_size": cfg.DEC_PATCH_SIZE,
             "mlp_ratio": cfg.MLP_RATIO,
             "qkv_bias": cfg.QKV_BIAS,
-            "qk_scale": cfg.QK_SCALE,
+            "qk_scale": optional_float(cfg.QK_SCALE),
             "attn_drop": cfg.ATTN_DROP,
             "proj_drop": cfg.PROJ_DROP,
             "drop_path": cfg.DROP_PATH,
@@ -337,7 +337,7 @@ class PTv3_EncoderV3(PointTransformerV3):
             "enc_patch_size": cfg.ENC_PATCH_SIZE,
             "mlp_ratio": cfg.MLP_RATIO,
             "qkv_bias": cfg.QKV_BIAS,
-            "qk_scale": cfg.QK_SCALE,
+            "qk_scale": optional_float(cfg.QK_SCALE),
             "attn_drop": cfg.ATTN_DROP,
             "proj_drop": cfg.PROJ_DROP,
             "drop_path": cfg.DROP_PATH,

@@ -52,6 +52,18 @@ def read_yaml_config(file_path):
     return cfg
 
 
+def optional_float(value):
+    """Decode a config entry that is either a float or unset.
+
+    YAML spells the empty value ``null``; a bare ``None`` is parsed as the
+    truthy string "None", which silently survives ``value or default`` guards
+    and then fails deep inside kernels that want a real float.
+    """
+    if value is None or value == "None":
+        return None
+    return float(value)
+
+
 def configurable(init_func=None, *, from_config=None):
 
     """
