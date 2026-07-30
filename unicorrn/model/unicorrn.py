@@ -8,7 +8,7 @@ Gaussian-attention decoder for cross-modal matching. The frustum fork adds a
 import torch
 import torch.nn as nn
 
-from .backbones import build_encoder
+from .backbones import ENCODER_REGISTRY, build_encoder
 from .blocks.utils import freeze_modules
 from .build import MODEL_REGISTRY
 from .embedder import ManyAR_PatchEmbed, RoPE2D, get_2d_sincos_pos_embed
@@ -28,10 +28,15 @@ class UniCorrn(nn.Module):
         self.cfg = cfg
         self.bidirectional = cfg.BIDIRECTIONAL
 
-        self.patch_embed = ManyAR_PatchEmbed(
-            cfg.IMG_SIZE, cfg.PATCH_SIZE, 3, cfg.BACKBONE.IMAGE.EMBED_DIM, upscale=False
-        )
-        num_patches = self.patch_embed.num_patches
+        image_encoder_cls = ENCODER_REGISTRY.get(cfg.BACKBONE.IMAGE.NAME)
+        if getattr(image_encoder_cls, "consumes_raw_image", False):
+            self.patch_embed = nn.Identity()
+            num_patches = 0
+        else:
+            self.patch_embed = ManyAR_PatchEmbed(
+                cfg.IMG_SIZE, cfg.PATCH_SIZE, 3, cfg.BACKBONE.IMAGE.EMBED_DIM, upscale=False
+            )
+            num_patches = self.patch_embed.num_patches
 
         if cfg.IMG_POS_EMBED == "cosine":
             # positional embedding
@@ -78,6 +83,10 @@ class UniCorrn(nn.Module):
         self.decoder.joint_finetune_trainable()
 
     def _encode_img(self, img):
+        # DINOv3-style backbones patchify the raw image themselves; CrocoV2 needs
+        # pre-patchified tokens + 2D positions from patch_embed.
+        if getattr(self.img_encoder, "consumes_raw_image", False):
+            return self.img_encoder(img)[0]
         B = img.shape[0]
         true_shape = torch.tensor(img.shape[-2:])[None].repeat(B, 1)
         patches, pos = self.patch_embed(img, true_shape)
@@ -86,6 +95,9 @@ class UniCorrn(nn.Module):
         return img_feat
 
     def _encode_img_pair(self, img1, img2):
+        if getattr(self.img_encoder, "consumes_raw_image", False):
+            feat, _, _ = self.img_encoder(torch.cat((img1, img2), dim=0))
+            return feat.chunk(2, dim=0)
         B = img1.shape[0]
         true_shape1 = torch.tensor(img1.shape[-2:])[None].repeat(B, 1)
         true_shape2 = torch.tensor(img2.shape[-2:])[None].repeat(B, 1)

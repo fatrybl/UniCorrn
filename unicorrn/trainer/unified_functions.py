@@ -13,20 +13,27 @@ from .functions import loss_functions, ConfidenceMatchingLoss, InfoNCE
 
 @loss_functions.register()
 class FrustumClassificationLoss:
-    """Deep-supervised focal BCE for geometric frustum membership.
+    """Deep-supervised focal BCE plus signed-distance regression for frustum membership.
 
-    Applies focal binary cross-entropy to every decoder-layer frustum readout,
-    weighting deeper layers more via an exponential decay (gamma), mirroring the
-    auxiliary matching supervision.
+    Every decoder-layer readout emits an in/out logit and the signed distance of the
+    query's projection to the frustum boundary; deeper layers weigh more via an
+    exponential decay (gamma), mirroring the auxiliary matching supervision. The
+    regression term supplies an ordered, dense target whose gradient does not vanish
+    at the boundary, which pure binary supervision cannot provide.
 
-        focal = (1 - p_t) ** focal_gamma,   loss = focal * BCE(logit, label)
+        focal = (1 - p_t) ** focal_gamma
+        loss  = focal * BCE(logit, label) + dist_weight * SmoothL1(distance, target)
     """
 
-    def __init__(self, gamma=0.8, focal_gamma=2.0, pos_weight=1.0):
-        """Initialise decay, focal-loss exponent and positive-class BCE weight."""
+    def __init__(
+        self, gamma=0.8, focal_gamma=2.0, pos_weight=1.0, dist_weight=1.0, huber_beta=0.1
+    ):
+        """Initialise decay, focal exponent, class weight and regression weighting."""
         self.gamma = gamma
         self.focal_gamma = focal_gamma
         self.pos_weight = pos_weight
+        self.dist_weight = dist_weight
+        self.huber_beta = huber_beta
 
     def _focal_bce(self, logits, labels):
         """Focal binary cross-entropy for a single prediction layer."""
@@ -38,17 +45,34 @@ class FrustumClassificationLoss:
         focal = (1 - torch.where(labels > 0.5, p, 1 - p)) ** self.focal_gamma
         return (focal * ce).mean()
 
-    def __call__(self, frustum_intermediates, labels, **kwargs):
-        """Compute γ-decayed focal BCE over all decoder-layer frustum readouts."""
+    def __call__(self, frustum_intermediates, labels, distances=None, **kwargs):
+        """Compute γ-decayed focal BCE and signed-distance regression over all readouts.
+
+        Args:
+            frustum_intermediates: Per-layer readouts holding logit and signed distance.
+            labels: Ground-truth in/out membership.
+            distances: Ground-truth signed boundary distances; skips regression if None.
+        """
         labels = labels.float()
         num_layers = len(frustum_intermediates)
-        loss = 0.0
+        loss, cls_loss, dist_loss = 0.0, 0.0, 0.0
         for idx in range(num_layers):
             decay = self.gamma ** (num_layers - idx - 1)
-            loss = loss + decay * self._focal_bce(
-                frustum_intermediates[idx].squeeze(-1), labels
-            )
-        return loss, {"frustum_loss": loss.item() if torch.is_tensor(loss) else loss}
+            layer = frustum_intermediates[idx]
+            layer_cls = self._focal_bce(layer[..., 0], labels)
+            cls_loss = cls_loss + layer_cls
+            loss = loss + decay * layer_cls
+            if distances is not None:
+                layer_dist = F.smooth_l1_loss(
+                    layer[..., 1], distances.float(), beta=self.huber_beta
+                )
+                dist_loss = dist_loss + layer_dist
+                loss = loss + decay * self.dist_weight * layer_dist
+        return loss, {
+            "frustum_loss": loss.item() if torch.is_tensor(loss) else loss,
+            "frustum_cls": cls_loss.item() if torch.is_tensor(cls_loss) else cls_loss,
+            "frustum_dist": dist_loss.item() if torch.is_tensor(dist_loss) else dist_loss,
+        }
 
 
 class _GlobalMatchingLoss:

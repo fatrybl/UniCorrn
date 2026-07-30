@@ -359,7 +359,11 @@ class QueryMatchingDecoder(nn.Module):
             if len(ret) == 3:
                 q, hidden_state, gm_tgt = ret
                 gm_out.append(gm_tgt[..., :2])
-                frustum_out.append(self.frustum_head(q, hidden_state, gm_tgt[..., :2]))
+                frustum_out.append(
+                    self.frustum_head(
+                        q, hidden_state, gm_tgt[..., :2], self.corr_embed_2d(hidden_state)
+                    )
+                )
             else:
                 q, hidden_state = ret
 
