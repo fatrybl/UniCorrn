@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+from ..grad_ckpt import grad_checkpointing_enabled
+
 from functools import partial
 
 from .build import ENCODER_REGISTRY
@@ -107,7 +109,7 @@ class CrocoV2_Encoder(nn.Module):
             posvis = pos
 
         # now apply the transformer encoder and normalization        
-        ckpt = self.training and torch.is_grad_enabled() and x.requires_grad
+        ckpt = grad_checkpointing_enabled() and self.training and torch.is_grad_enabled() and x.requires_grad
         if return_all_blocks:
             out = []
             for blk in self.enc_blocks:

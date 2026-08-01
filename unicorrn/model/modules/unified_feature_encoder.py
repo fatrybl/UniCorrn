@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+from ..grad_ckpt import grad_checkpointing_enabled
+
 from ...utils import cartesian_img_coord
 from ...utils.config import configurable
 from ..blocks import MMDecoderBlockBidirectional
@@ -18,7 +20,7 @@ def _ckpt(training, fn, *args):
     so inference and frozen-encoder training are unaffected.
     """
     needs_grad = any(torch.is_tensor(a) and a.requires_grad for a in args)
-    if training and torch.is_grad_enabled() and needs_grad:
+    if grad_checkpointing_enabled() and training and torch.is_grad_enabled() and needs_grad:
         return checkpoint(fn, *args, use_reentrant=False)
     return fn(*args)
 

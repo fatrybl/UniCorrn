@@ -15,6 +15,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
+from ..grad_ckpt import grad_checkpointing_enabled
+
 from ...utils.config import configurable
 from ..blocks import DualStreamQueryDecoderBlock, FrustumHead, GaussianKNNSample, Mlp
 from ..blocks.utils import freeze_modules, offset2batch
@@ -30,7 +32,7 @@ def _declone(x):
 def _ckpt(training, fn, *args, **kwargs):
     """Gradient-checkpoint ``fn`` during training (recompute in backward, save memory)."""
     needs_grad = any(torch.is_tensor(a) and a.requires_grad for a in args)
-    if not (training and torch.is_grad_enabled() and needs_grad):
+    if not (grad_checkpointing_enabled() and training and torch.is_grad_enabled() and needs_grad):
         return fn(*args, **kwargs)
     args = tuple(_declone(a) for a in args)
     kwargs = {k: _declone(v) for k, v in kwargs.items()}
