@@ -232,7 +232,7 @@ FRUSTUM_LOSS:
   PARAMS:
     gamma: 0.8
     focal_gamma: 2.0
-    pos_weight: 1.0
+    huber_beta: 0.1   # see docs/frustum_multitask_plan.md 13.2 before lowering
 BATCH_SIZE: 6
 GRADIENT_ACCUMULATION_STEPS: 1
 NUM_WORKERS: 8

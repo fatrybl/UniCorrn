@@ -2,7 +2,8 @@
 
 Status: **implemented** on branch `frustum-multitask` (fork `UniCorrn-Frustum`).
 Sections 1–2 give the theory; **Section 12 is the authoritative as-built description** and
-supersedes the earlier exploratory proposal (notably: the model takes **no camera parameters as
+**Section 13 records what training measured and which parts of the design it revises**.
+Section 12 supersedes the earlier exploratory proposal (notably: the model takes **no camera parameters as
 input** — see updated §1.4 — and frustum queries are a **separate** query set, so no masking of
 the matching losses is required).
 Author intent: extend the existing 2D↔3D matcher so that, in the **point-cloud → image**
@@ -439,10 +440,115 @@ only the matcher + frustum head adapt.
 
 ### 12.6 Not yet done / follow-ups
 
+- **The signed-distance regression is not wired on this branch.** `build_frustum_queries`
+  returns `(queries, labels)` only, and `UnifiedTrainer._run_step_img2pcd` calls
+  `frustum_loss_fn(intermediates, labels)` with no `distances`, so `dist_weight` is inert and
+  the head's second channel is trained only through the logit. Section 13 explains why this
+  matters more than it looks. Emit the target from `frustum_labels.py` and pass it through.
 - Replicate the dataset change in `rgbdscenes.py` (and the joint collate
-  `JointTrainingCollateFn._prepare_img2pcd`) if those loaders are used.
+  `JointTrainingCollateFn._prepare_img2pcd`) if those loaders are used. Note the intrinsics
+  rescale in `sevenscenes_hard.py` / `rgbdscenes.py` scales `fx, cx` by the *height* ratio and
+  `fy, cy` by the *width* ratio; the axes are swapped. It cancels for 7Scenes (640×480 →
+  384×512, both 0.8) but will corrupt frustum labels on any non-aspect-preserving resize.
 - Add a validation metric (precision/recall/F1, boundary-band recall) in
   `UnifiedTrainer.evaluate`.
 - Downstream `L_z(T)` consistency term for calibration (Section 1.3) lives in the calibration
   codebase, not here.
+
+---
+
+## 13. Measured behaviour and the fixes it implies
+
+Four epochs of the downstream VAPE fine-tune (nuScenes + S3DIS + S3E + ScanNet++, `dist_weight
+= 0.5`, so the regression *is* active there) converged to `frustum_acc ≈ 0.91` with
+`frustum_edge_acc ≈ 0.69` in the `|s*| < 0.02` band, both flat over the last 1000 steps. Three
+findings generalise back to this design.
+
+### 13.1 Accuracy is the regression's, not the classifier's
+
+`logit = d · e^{log_scale}` with `e^{log_scale} > 0`, so `σ(logit) > ½ ⟺ d > 0`: the predicted
+class is exactly `sign(d)`. The target satisfies `s* > 0 ⟺ in-frustum` by construction, so
+**classification accuracy equals the sign agreement of the distance regression**. The BCE term
+shapes gradients but never casts the vote, and the temperature cannot change a single
+prediction. Anything aimed at accuracy has to act on `d`.
+
+This is why the missing regression (§12.6) matters beyond a disabled term: without it, `d` is
+fitted only through BCE, which determines it just up to a positive scale — it is a scaled
+log-odds, not a distance — and the identity above then gives the classifier nothing extra.
+
+### 13.2 `huber_beta` must match the boundary band — but not go below it
+
+SmoothL1 has gradient `min(|e| / beta, 1)`. At the default `beta = 0.1` against a target
+spanning `±0.5`, a boundary-scale error of `0.02` gets `0.2` gradient while a tail error of
+`0.4` gets `1.0` — five times more weight on points whose class no decision depends on. Setting
+`beta` to the band scale puts boundary errors in the linear regime at full gradient and leaves
+the tails unchanged.
+
+The failure mode on the other side is sharper than expected. Once `beta` drops below the error
+the model can actually achieve, *every* residual is in the linear regime, the term is L1, and its
+optimum is the conditional **median** rather than the mean. While the matcher is weak the
+features are near-uninformative, the target's conditional median collapses to ≈ 0, and band
+predictions land on zero with an arbitrary sign — accuracy pinned at chance. Measured at
+`beta = 0.02`: band MAE reached 0.030, then *regressed* to 0.052 while band accuracy sat at 0.51.
+Keep the library default of 0.1 until the band error is demonstrably below it.
+
+### 13.3 Sample the band, and measure it
+
+`build_frustum_queries` splits 50/50 *by class* and draws uniformly within each, which places
+only a few percent of queries in the decision band — band membership scales with the cone's
+surface, not its volume, while §1.2's axial signal exists only there. Drawing a fixed share of
+each class from `|s*| < 0.05` raises the in-band share roughly 3× at unchanged class balance.
+
+For diagnostics, pooled distance MAE is misleading: it is dominated by saturated targets and
+moves largely independently of accuracy. Report MAE restricted to the band. For boundary error
+`σ` and `|s*|` roughly uniform across an evaluation band `B`, expected band accuracy is
+`Φ(a) + (φ(a) − φ(0))/a` with `a = B/σ` — at `B = 0.02`, `σ = 0.02` gives 0.68 and `σ = 0.0067`
+gives 0.87, which is how to size the sharpening a target accuracy requires.
+
+### 13.4 T-independence of the *inputs* is not T-independence of the *frame*
+
+§1.4 keeps `T` out of the model's inputs so membership cannot collapse to a reprojection.
+That is necessary but not sufficient. The label is a function of `T`; if the cloud reaches
+the model in the sensor's own frame and the camera is rigidly mounted, membership becomes a
+fixed function of the input coordinates and the head can satisfy the loss without reading
+the image at all. `T` was never fed in — it leaked through the coordinate frame.
+
+Measured on the downstream fixed-rig pool (nuScenes / S3DIS / S3E / ScanNet++): about nine
+distinct extrinsics across the whole training set. A 2-layer MLP on the normalised
+coordinates alone, no image, split by scene and scored on the same balanced query set the
+head uses (chance 0.500), reaches **0.79–0.83** — against the full model's 0.911. Most of
+the headline accuracy needs no image at all. Inside the boundary band the same probe sits
+at **0.48–0.56**, i.e. chance, at every randomisation level, while the trained model
+reaches 0.691: whatever the head genuinely learned from the image lives entirely in the
+band, which is a second argument for §13.3's band metrics.
+
+Three consequences for this branch:
+
+- `normalize_coord` removes translation and scale exactly, so the **rotation** of the input
+  frame is the only residual rig information and the only thing worth randomising.
+- **But full `SO(3)` was not trainable here, and the probe does not predict that.** The
+  probe measures what a small MLP extracts from coordinates, not what the full model can
+  learn. At `max_rotation=180°` from a random decoder init the downstream model did not
+  recover: `img2pcd_l1` plateaued at 0.55 against a 0.31 baseline, band accuracy stayed at
+  chance for 899 steps. Full `SO(3)` makes the task complete 2D-3D registration with no
+  pose prior — exactly what stage-1/stage-2 pretraining provides, and not something a
+  random decoder bootstraps on 7 300 samples. `random_se3(max_rotation=45°)` removes only
+  ~0.04–0.08 of the leak but is at least trainable. Randomising **yaw only** would break a
+  fixed rig's memorised azimuth while preserving the gravity prior the point encoder
+  depends on; that is the untested middle option worth trying first.
+- `sevenscenes_hard.py` / `rgbdscenes.py` apply `random_sample_small_transform(scale=0.1)`
+  — deliberate weak jitter, far too small to decorrelate a frame. That is acceptable for
+  7Scenes and RGBD-V2, where a handheld camera makes `T` genuinely vary per frame, and
+  **not** acceptable for any fixed-rig dataset added later. Measure the spread of `T`, and
+  run the coords-only probe, before trusting a frustum number on a new loader.
+
+### 13.5 Two limits this design has not yet tested
+
+- **The temperature has no finite optimum.** Because the label is exactly `sign(s*)`, the data
+  is separable in `d` and BCE drives `log_scale` up without bound; measured, it rises linearly
+  in the step count (`R² = 0.99998`) with weight decay ~230× too weak to oppose it. Harmless for
+  accuracy (§13.1), fatal for treating `σ(d/T)` as calibrated over a long run.
+- **§1.4's implicit-`K` claim is untested here.** With a single IMG2PCD dataset at one fixed
+  intrinsic, "infers `K` from image content" and "memorised 7Scenes' `K`" are
+  indistinguishable. Adding RGBD-V2 turns the assumption into a measurement.
 

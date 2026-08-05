@@ -18,29 +18,35 @@ class FrustumClassificationLoss:
     Every decoder-layer readout emits an in/out logit and the signed distance of the
     query's projection to the frustum boundary; deeper layers weigh more via an
     exponential decay (gamma), mirroring the auxiliary matching supervision. The
-    regression term supplies an ordered, dense target whose gradient does not vanish
-    at the boundary, which pure binary supervision cannot provide.
+    regression term supplies an ordered, dense target, which pure binary supervision
+    cannot provide.
 
         focal = (1 - p_t) ** focal_gamma
         loss  = focal * BCE(logit, label) + dist_weight * SmoothL1(distance, target)
+
+    ``huber_beta`` must be set to the scale of the boundary band, not left at a value
+    sized for the target's full range. SmoothL1 has gradient ``min(|e| / beta, 1)``, so
+    with beta well above the boundary scale the near-boundary errors that decide the
+    class land in the quadratic regime and are down-weighted relative to large errors on
+    saturated targets, whose precision changes no decision. When the head derives its
+    logit as ``distance * exp(log_scale)`` the predicted class is exactly
+    ``sign(distance)``, so this term - not the BCE - is what sets accuracy.
     """
 
-    def __init__(
-        self, gamma=0.8, focal_gamma=2.0, pos_weight=1.0, dist_weight=1.0, huber_beta=0.1
-    ):
-        """Initialise decay, focal exponent, class weight and regression weighting."""
+    def __init__(self, gamma=0.8, focal_gamma=2.0, dist_weight=1.0, huber_beta=0.1):
+        """Initialise decay, focal exponent and regression weighting."""
         self.gamma = gamma
         self.focal_gamma = focal_gamma
-        self.pos_weight = pos_weight
         self.dist_weight = dist_weight
         self.huber_beta = huber_beta
 
     def _focal_bce(self, logits, labels):
-        """Focal binary cross-entropy for a single prediction layer."""
-        pos_weight = torch.tensor(self.pos_weight, device=logits.device)
-        ce = F.binary_cross_entropy_with_logits(
-            logits, labels, reduction="none", pos_weight=pos_weight
-        )
+        """Focal binary cross-entropy for a single prediction layer.
+
+        No class weight: the query sampler emits an equal number of in- and
+        out-of-frustum rows, so the two classes are balanced by construction.
+        """
+        ce = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
         p = torch.sigmoid(logits)
         focal = (1 - torch.where(labels > 0.5, p, 1 - p)) ** self.focal_gamma
         return (focal * ce).mean()
