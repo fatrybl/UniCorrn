@@ -215,10 +215,9 @@ class ImageToPointRegistrationCollateFn(Callable):
         # collated_dict['norm_length'] = np.asarray(collated_dict.pop('norm_length'))
 
         if data_dicts[0].get("frustum_queries") is not None:
-            fq = collated_dict["frustum_queries"]
-            fl = collated_dict["frustum_labels"]
-            collated_dict["frustum_queries"] = fq[None] if isinstance(fq, np.ndarray) else np.stack(fq, axis=0)
-            collated_dict["frustum_labels"] = fl[None] if isinstance(fl, np.ndarray) else np.stack(fl, axis=0)
+            for key in ("frustum_queries", "frustum_labels", "frustum_distances"):
+                val = collated_dict[key]
+                collated_dict[key] = val[None] if isinstance(val, np.ndarray) else np.stack(val, axis=0)
 
         # 3. array to tensor
         collated_dict = array_to_tensor(collated_dict)

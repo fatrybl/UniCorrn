@@ -265,11 +265,12 @@ class SevenScenes2D3DHardPairDataset(EasyDataset):
                     fr_h, fr_w = self.new_resolution
                 else:
                     fr_h, fr_w = data_dict['image_h'], data_dict['image_w']
-                frustum_queries, frustum_labels = build_frustum_queries(
+                frustum_queries, frustum_labels, frustum_distances = build_frustum_queries(
                     points, transform, intrinsics, fr_h, fr_w, self.num_frustum_queries
                 )
                 data_dict['frustum_queries'] = frustum_queries
                 data_dict['frustum_labels'] = frustum_labels
+                data_dict['frustum_distances'] = frustum_distances
             points, points_norm_meta = normalize_coord(points, return_meta=True)
             data_dict['norm_targets'] = norm_targets
             data_dict['points_norm_meta'] = points_norm_meta

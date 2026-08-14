@@ -56,7 +56,9 @@ class UnifiedTrainer:
 
         if frustum_loss_fn is not None and frustum_queries is not None:
             frustum_loss, frustum_details = frustum_loss_fn(
-                pred['frustum_intermediates'], batch['frustum_labels']
+                pred['frustum_intermediates'],
+                batch['frustum_labels'],
+                batch['frustum_distances'],
             )
             loss = loss + self.frustum_wt * frustum_loss
             loss_details.update(frustum_details)

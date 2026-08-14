@@ -17,27 +17,33 @@ class FrustumClassificationLoss:
 
     Every decoder-layer readout emits an in/out logit and the signed distance of the
     query's projection to the frustum boundary; deeper layers weigh more via an
-    exponential decay (gamma), mirroring the auxiliary matching supervision. The
-    regression term supplies an ordered, dense target, which pure binary supervision
-    cannot provide.
+    exponential decay (gamma), mirroring the auxiliary matching supervision.
 
         focal = (1 - p_t) ** focal_gamma
-        loss  = focal * BCE(logit, label) + dist_weight * SmoothL1(distance, target)
+        loss  = focal * BCE(logit, label) + SmoothL1(distance, target)
+
+    The terms carry equal weight because they no longer compete: the head detaches the
+    distance on its logit branch, so the BCE reaches only the temperature and the
+    regression only the trunk. Their relative scale would merely retune the temperature's
+    step size, so the only meaningful knob is one weight on the whole frustum objective,
+    and that belongs to the caller.
+
+    Since the label is exactly ``sign(target)`` and the predicted class exactly
+    ``sign(distance)``, the regression - not the BCE - is what sets accuracy. The focal
+    exponent down-weights confidently classified queries, so the temperature is fitted by
+    the boundary queries, where membership has to be graded.
 
     ``huber_beta`` must be set to the scale of the boundary band, not left at a value
     sized for the target's full range. SmoothL1 has gradient ``min(|e| / beta, 1)``, so
     with beta well above the boundary scale the near-boundary errors that decide the
     class land in the quadratic regime and are down-weighted relative to large errors on
-    saturated targets, whose precision changes no decision. When the head derives its
-    logit as ``distance * exp(log_scale)`` the predicted class is exactly
-    ``sign(distance)``, so this term - not the BCE - is what sets accuracy.
+    saturated targets, whose precision changes no decision.
     """
 
-    def __init__(self, gamma=0.8, focal_gamma=2.0, dist_weight=1.0, huber_beta=0.1):
-        """Initialise decay, focal exponent and regression weighting."""
+    def __init__(self, gamma=0.8, focal_gamma=2.0, huber_beta=0.1):
+        """Initialise decay, focal exponent and regression transition width."""
         self.gamma = gamma
         self.focal_gamma = focal_gamma
-        self.dist_weight = dist_weight
         self.huber_beta = huber_beta
 
     def _focal_bce(self, logits, labels):
@@ -51,14 +57,21 @@ class FrustumClassificationLoss:
         focal = (1 - torch.where(labels > 0.5, p, 1 - p)) ** self.focal_gamma
         return (focal * ce).mean()
 
-    def __call__(self, frustum_intermediates, labels, distances=None, **kwargs):
+    def __call__(self, frustum_intermediates, labels, distances, **kwargs):
         """Compute γ-decayed focal BCE and signed-distance regression over all readouts.
 
         Args:
             frustum_intermediates: Per-layer readouts holding logit and signed distance.
             labels: Ground-truth in/out membership.
-            distances: Ground-truth signed boundary distances; skips regression if None.
+            distances: Ground-truth signed boundary distances.
+
+        Raises:
+            ValueError: If distances are missing. Since the head detaches the distance on
+                its logit branch, the BCE reaches only the temperature, so dropping the
+                regression would leave the head's trunk with no gradient at all.
         """
+        if distances is None:
+            raise ValueError("FrustumClassificationLoss requires signed-distance targets")
         labels = labels.float()
         num_layers = len(frustum_intermediates)
         loss, cls_loss, dist_loss = 0.0, 0.0, 0.0
@@ -68,12 +81,11 @@ class FrustumClassificationLoss:
             layer_cls = self._focal_bce(layer[..., 0], labels)
             cls_loss = cls_loss + layer_cls
             loss = loss + decay * layer_cls
-            if distances is not None:
-                layer_dist = F.smooth_l1_loss(
-                    layer[..., 1], distances.float(), beta=self.huber_beta
-                )
-                dist_loss = dist_loss + layer_dist
-                loss = loss + decay * self.dist_weight * layer_dist
+            layer_dist = F.smooth_l1_loss(
+                layer[..., 1], distances.float(), beta=self.huber_beta
+            )
+            dist_loss = dist_loss + layer_dist
+            loss = loss + decay * layer_dist
         return loss, {
             "frustum_loss": loss.item() if torch.is_tensor(loss) else loss,
             "frustum_cls": cls_loss.item() if torch.is_tensor(cls_loss) else cls_loss,
@@ -82,6 +94,11 @@ class FrustumClassificationLoss:
 
 
 class _GlobalMatchingLoss:
+    """Per-layer coordinate regression, reduced over coordinates by a mean.
+
+    The mean keeps 2D and 3D targets commensurate; see ``ConfidenceMatchingLoss``.
+    """
+
     def __init__(self, reg_loss='l1'):
         self.reg_loss = reg_loss
 
@@ -89,11 +106,11 @@ class _GlobalMatchingLoss:
         assert output.shape[2] == 2 or output.shape[2] == 3, f"expected channels 2 or 3 but received {output.shape[2]}"
 
         if self.reg_loss == "l1":
-            loss = F.l1_loss(output, target, reduction="none").sum(dim=2, keepdim=True)
+            loss = F.l1_loss(output, target, reduction="none").mean(dim=2, keepdim=True)
         elif self.reg_loss == "l2":
-            loss = torch.norm(target - output, dim=2, keepdim=True)
+            loss = torch.norm(target - output, dim=2, keepdim=True) / output.shape[2] ** 0.5
         elif self.reg_loss == "smooth_l1":
-            loss = F.smooth_l1_loss(output, target, reduction="none").sum(dim=2, keepdim=True)
+            loss = F.smooth_l1_loss(output, target, reduction="none").mean(dim=2, keepdim=True)
         else:
             raise NotImplementedError
 

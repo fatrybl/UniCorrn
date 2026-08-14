@@ -26,15 +26,21 @@ schedulers.register(OneCycleLR, "OneCycleLR")
 class ConfidenceMatchingLoss:
     """ 
     Adapted from DUSt3R : https://github.com/naver/dust3r
-    
+
     Weighted L1/L2 regression by learned confidence.
-    
+
 
     Principle:
         high-confidence means high conf = 0.1 ==> conf_loss = x / 10 + alpha*log(10)
-        low  confidence means low  conf = 10  ==> conf_loss = x * 10 - alpha*log(10) 
+        low  confidence means low  conf = 10  ==> conf_loss = x * 10 - alpha*log(10)
 
         alpha: hyperparameter
+
+    The per-query residual is reduced over coordinates by a *mean*, not a sum, so that a
+    2D image target and a 3D point target stay commensurate: a channel sum would make the
+    3D task score higher purely for having one more channel. The mean is dimension-
+    agnostic, introduces no parameter, and brings the confidence into range, since the
+    term is minimised at conf = alpha / loss and clipped below at vmin = 1.
     """
 
     def __init__(self, reg_loss='l1', alpha=0.2, vmin=1, vmax=float('inf'), mode='exp', robust=False):
@@ -57,11 +63,11 @@ class ConfidenceMatchingLoss:
         assert info_predictions.shape[2] == 1, f"expected channels 1 but received {info_predictions.shape[2]}"
 
         if self.reg_loss == "l1":
-            loss = F.l1_loss(corr_predictions, target, reduction="none").sum(dim=2, keepdim=True)
+            loss = F.l1_loss(corr_predictions, target, reduction="none").mean(dim=2, keepdim=True)
         elif self.reg_loss == "l2":
-            loss = torch.norm(target - corr_predictions, dim=2, keepdim=True)
+            loss = torch.norm(target - corr_predictions, dim=2, keepdim=True) / corr_predictions.shape[2] ** 0.5
         elif self.reg_loss == "smooth_l1":
-            loss = F.smooth_l1_loss(corr_predictions, target, reduction="none").sum(dim=2, keepdim=True)
+            loss = F.smooth_l1_loss(corr_predictions, target, reduction="none").mean(dim=2, keepdim=True)
 
         if self.robust:
             epsilon = 0.01

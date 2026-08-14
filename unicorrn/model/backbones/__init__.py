@@ -3,3 +3,4 @@ from .crocov2_encoder import *
 from .point_transformer_v3 import *
 from .litept_v1 import LitePT, LitePT_Encoder
 from .dinov3_encoder import DinoV3_Encoder
+from .dual_image_encoder import DualImage_Encoder

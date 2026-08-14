@@ -14,6 +14,7 @@ tokens (CLS + 4 registers), stripped here so only the ``(H/16, W/16)`` patch gri
 """
 
 import os
+from typing import Self
 
 import timm
 import torch.nn as nn
@@ -88,8 +89,23 @@ class DinoV3_Encoder(nn.Module):
         tokens = self._backbone.forward_features(img)
         return tokens[:, self._num_prefix :, :], None, None
 
+    def train(self, mode: bool = True) -> Self:
+        """Set training mode, keeping a frozen backbone in eval.
+
+        ``nn.Module.train`` recurses into children, so without this a later
+        ``model.train()`` would undo the eval state ``freeze_croco_weights`` set.
+
+        Args:
+            mode: Whether the module enters training mode.
+        """
+        super().train(mode)
+        if self._frozen:
+            self._backbone.eval()
+        return self
+
     def freeze_croco_weights(self):
         """Freeze the ViT (name mirrors ``CrocoV2_Encoder`` so UniCorrn's freeze calls work)."""
+        self._frozen = True
         self._backbone.eval()
         for param in self._backbone.parameters():
             param.requires_grad = False
