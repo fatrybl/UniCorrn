@@ -5,6 +5,10 @@ from ..blocks import PointTransformerV3
 from .build import ENCODER_REGISTRY
 
 
+# Space-filling curves the attention blocks read points along, when a config names none.
+DEFAULT_ORDER = ("z", "z-trans", "hilbert", "hilbert-trans")
+
+
 @ENCODER_REGISTRY.register()
 class PTv3_Encoder(PointTransformerV3):
     """
@@ -103,6 +107,7 @@ class PTv3_Encoder(PointTransformerV3):
             "proj_drop": cfg.PROJ_DROP,
             "drop_path": cfg.DROP_PATH,
             "pre_norm": cfg.PRE_NORM,
+            "order": cfg.get("ORDER", DEFAULT_ORDER),
             "shuffle_orders": cfg.SHUFFLE_ORDERS,
             "enable_rpe": cfg.ENABLE_RPE,
             "enable_flash": cfg.ENABLE_FLASH,
@@ -217,6 +222,7 @@ class PTv3_EncoderV2(PointTransformerV3):
             "proj_drop": cfg.PROJ_DROP,
             "drop_path": cfg.DROP_PATH,
             "pre_norm": cfg.PRE_NORM,
+            "order": cfg.get("ORDER", DEFAULT_ORDER),
             "shuffle_orders": cfg.SHUFFLE_ORDERS,
             "enable_rpe": cfg.ENABLE_RPE,
             "enable_flash": cfg.ENABLE_FLASH,
@@ -342,6 +348,7 @@ class PTv3_EncoderV3(PointTransformerV3):
             "proj_drop": cfg.PROJ_DROP,
             "drop_path": cfg.DROP_PATH,
             "pre_norm": cfg.PRE_NORM,
+            "order": cfg.get("ORDER", DEFAULT_ORDER),
             "shuffle_orders": cfg.SHUFFLE_ORDERS,
             "enable_rpe": cfg.ENABLE_RPE,
             "enable_flash": cfg.ENABLE_FLASH,

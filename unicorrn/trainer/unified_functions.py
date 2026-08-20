@@ -29,9 +29,19 @@ class FrustumClassificationLoss:
     and that belongs to the caller.
 
     Since the label is exactly ``sign(target)`` and the predicted class exactly
-    ``sign(distance)``, the regression - not the BCE - is what sets accuracy. The focal
-    exponent down-weights confidently classified queries, so the temperature is fitted by
-    the boundary queries, where membership has to be graded.
+    ``sign(distance)``, the regression - not the BCE - is what sets accuracy, and the BCE
+    is left fitting the temperature alone.
+
+    That temperature settles on the *pooled* distance scale, not the boundary one. At the
+    optimum ``sum_i (sigmoid(s*d_i) - y_i) * d_i = 0``: correctly classified queries push
+    ``s`` up with weight ``|d| * (1 - sigmoid(s|d|))``, which vanishes once ``s|d| >> 1``,
+    while confidently wrong ones push it down at full focal weight. The balance is
+    therefore set by the whole ``|d|`` distribution and the error rate. Measured over a
+    4-epoch run, ``1/s`` tracked the pooled distance MAE at a near-constant 3.8-4.0x while
+    its ratio to the boundary-band MAE drifted 4.4 -> 2.4, so the focal exponent tilts the
+    fit toward the band without dominating it. ``1/s`` is consequently a usable running
+    estimate of the head's own error scale, which ``consistency.LEARNED_TAU`` is defined
+    from.
 
     ``huber_beta`` must be set to the scale of the boundary band, not left at a value
     sized for the target's full range. SmoothL1 has gradient ``min(|e| / beta, 1)``, so

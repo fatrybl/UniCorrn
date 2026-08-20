@@ -26,6 +26,7 @@ from ..blocks.point_transformer_v3 import (
     offset2bincount,
 )
 from .build import ENCODER_REGISTRY
+from .point_transformer_v3 import DEFAULT_ORDER
 
 try:
     import pointrope as _kernels
@@ -680,7 +681,7 @@ class LitePT(PointModule):
                         stride=stride[s - 1],
                         norm_layer=bn_layer,
                         act_layer=act_layer,
-                        re_serialization=enc_attn[s],
+                        re_serialization=True,
                         serialization_order=self.order,
                     ),
                     name="down",
@@ -771,8 +772,11 @@ class LitePT(PointModule):
            batch [N]: batch index of each point
         """
         point = Point(data_dict)
-        if self.enc_attn[0]:
-            point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
+        # LitePT serializes only where a stage attends, because its own decoder never
+        # revisits the conv-only stages. UniCorrn's PTv3 upsampler unpools through every
+        # stage and reads serialized_inverse there, so the order is needed everywhere; a
+        # sort is cheap next to the attention it stands in for.
+        point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
         point = self.embedding(point)
@@ -880,6 +884,7 @@ class LitePT_Encoder(LitePT):
             "proj_drop": cfg.PROJ_DROP,
             "drop_path": cfg.DROP_PATH,
             "pre_norm": cfg.PRE_NORM,
+            "order": cfg.get("ORDER", DEFAULT_ORDER),
             "shuffle_orders": cfg.SHUFFLE_ORDERS,
             "enc_mode": cfg.get("ENC_MODE", True),
             "project_dim": cfg.PROJECT_DIM,

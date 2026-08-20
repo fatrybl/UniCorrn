@@ -3,8 +3,17 @@ import torch.nn as nn
 
 from ..embedder import RoPE2D_Continuous, RoPE3D
 from .blocks import DropPath, Mlp
-from .kernel_attention import gaussian_flash_attn, gaussian_memory_efficient_attn
-from .utils import offset2batch
+from .kernel_attention import gaussian_flash_attn
+from .utils import freeze_modules, offset2batch
+
+
+def _merge_heads(attn_out, batch, length, channels):
+    """Fold ``gaussian_flash_attn``'s (B, H, N, C) output back to (B, N, H*C).
+
+    The kernel returns heads before sequence, unlike the xformers path; reshaping without
+    the transpose interleaves the two and is only harmless at a single head.
+    """
+    return attn_out.transpose(1, 2).reshape(batch, length, channels)
 
 
 class DualStreamCrossAttentionFA(nn.Module):
@@ -69,21 +78,21 @@ class DualStreamCrossAttentionFA(nn.Module):
 
         # Attention Stream 1 : appearance features
         v = self.projv(value).reshape(B, Nv, self.num_heads, C // self.num_heads)
-        x = gaussian_flash_attn(q, k, v, dropout_p=self.attn_drop).reshape([B, Nq, C])
+        x = _merge_heads(gaussian_flash_attn(q, k, v, dropout_p=self.attn_drop), B, Nq, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         # Attention Stream 2 : position features
-        res_out = gaussian_flash_attn(q, k, res, dropout_p=self.attn_drop).reshape(
-            [B, Nq, Cres]
+        res_out = _merge_heads(
+            gaussian_flash_attn(q, k, res, dropout_p=self.attn_drop), B, Nq, Cres
         )
         res_out = self.proj_res(res_out)
         res_out = self.proj_drop(res_out)
         # (Optional) Attention Stream 3 : GM raw coordinates
         if gm_res is not None:
             gm_res = gm_res.reshape(B, Nv, self.num_heads, 4 // self.num_heads)
-            gm_out = gaussian_memory_efficient_attn(
-                q, k, gm_res, p=self.attn_drop
-            ).reshape([B, Nq, 4])
+            gm_out = _merge_heads(
+                gaussian_flash_attn(q, k, gm_res, dropout_p=self.attn_drop), B, Nq, 4
+            )
             return x, res_out, gm_out
 
         return x, res_out
@@ -136,11 +145,11 @@ class DualStreamCrossAttentionFA(nn.Module):
 
             v = self.projv(v).reshape(1, -1, self.num_heads, C // self.num_heads)
             tgt_.append(
-                gaussian_flash_attn(q, k, v, dropout_p=self.attn_drop).reshape(1, -1, C)
+                _merge_heads(gaussian_flash_attn(q, k, v, dropout_p=self.attn_drop), 1, -1, C)
             )
             res_.append(
-                gaussian_flash_attn(q, k, res, dropout_p=self.attn_drop).reshape(
-                    1, -1, Cres
+                _merge_heads(
+                    gaussian_flash_attn(q, k, res, dropout_p=self.attn_drop), 1, -1, Cres
                 )
             )
 
@@ -149,9 +158,9 @@ class DualStreamCrossAttentionFA(nn.Module):
                     1, -1, self.num_heads, 4 // self.num_heads
                 )
                 gm_res_.append(
-                    gaussian_memory_efficient_attn(
-                        q, k, gm_res, p=self.attn_drop
-                    ).reshape(1, -1, 4)
+                    _merge_heads(
+                        gaussian_flash_attn(q, k, gm_res, dropout_p=self.attn_drop), 1, -1, 4
+                    )
                 )
 
         tgt = torch.cat(tgt_, dim=0)
@@ -227,6 +236,19 @@ class DualStreamQueryDecoderBlockFA(nn.Module):
             drop=drop,
         )
         # self.norm_tgt_mlp = norm_layer(dim)
+
+    def freeze_2d_weights(self):
+        freeze_modules(
+            self.cross_attn,
+            self.drop_path,
+            self.norm_tgt,
+            self.norm_mem,
+            self.norm_hidden_ca,
+            self.norm_hidden_mlp,
+            self.mlp_hidden,
+            self.norm_tgt_ca,
+            self.mlp_tgt,
+        )
 
     def forward_query_to_img(
         self, tgt, mem, kpos, res, hidden_state, img_query, gm_res=None

@@ -41,6 +41,14 @@ def _ckpt(training, fn, *args, **kwargs):
 
 @DECODER_REGISTRY.register()
 class QueryMatchingDecoder(nn.Module):
+    """Gaussian-attention query decoder; ``block_cls`` selects the attention kernel."""
+
+    block_cls = DualStreamQueryDecoderBlock
+
+    def block_kwargs(self, index):
+        """Per-block constructor extras. Args: index: Block position in the stack."""
+        return {}
+
     @configurable
     def __init__(
         self,
@@ -80,7 +88,7 @@ class QueryMatchingDecoder(nn.Module):
 
         self.query_decoder_blocks = nn.ModuleList(
             [
-                DualStreamQueryDecoderBlock(
+                self.block_cls(
                     dim=project_dim,
                     res_dim=pos_embed_dim,
                     num_heads=num_heads,
@@ -94,6 +102,7 @@ class QueryMatchingDecoder(nn.Module):
                     norm_mem=norm_mem,
                     pos_decoder2d=self.corr_embed_2d,
                     pos_decoder3d=self.corr_embed_3d,
+                    **self.block_kwargs(i),
                 )
                 for i in range(dec_depth)
             ]
