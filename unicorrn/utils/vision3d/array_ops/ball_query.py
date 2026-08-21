@@ -1,7 +1,7 @@
 from typing import List
 
 from numpy import ndarray
-from scipy.spatial.ckdtree import cKDTree
+from scipy.spatial import cKDTree
 
 
 def ball_query(q_points: ndarray, s_points: ndarray, radius: float) -> List[ndarray]:
