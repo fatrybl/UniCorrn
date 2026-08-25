@@ -425,7 +425,22 @@ Frustum is fully gated: with no `FRUSTUM_LOSS` in the config and `return_frustum
 builds an (unused) `frustum_head` but training/eval behave exactly as before. `safe_load_weights`
 absorbs the extra head when loading released checkpoints.
 
-### 12.5 How to run
+### 12.5 How to run — **superseded by VAPE**
+
+The live training path is the VAPE repo (`pcd-image-model`), which imports this fork as a
+library and drives it with its own loop, datasets and validation:
+
+```
+python -m vape.cli.train --config configs/train/rtx3090.yaml
+```
+
+The in-fork recipe below is kept for the record but is **not runnable as written**: the
+model configs were retargeted at VAPE's 4-channel point features (`IN_CHANNELS: 4` /
+`FEAT_CHANNELS: 4` — VAPE always emits `[xyz, intensity]`, zero-filling intensity when the
+cloud is xyz-only), while the in-fork loaders (7Scenes, MegaDepth pseudo-clouds) emit
+3-channel clouds with no `feats` key, so the PTv3 stem rejects them. It also expects a
+frustum-trained checkpoint that no longer exists (see `doc/vape/distortion_training.md`
+§9 in the VAPE repo).
 
 ```
 accelerate launch train.py \
@@ -434,26 +449,26 @@ accelerate launch train.py \
   --output_dir ./output/frustum --training_stage stage_1
 ```
 
-The `frustum_loss` scalar appears in the logged loss details. Recommended: warm-start from a
-released UniCorrn checkpoint (`RESUME.CKPT_PATH`) and, for a first run, freeze the backbones so
-only the matcher + frustum head adapt.
+### 12.6 Follow-up status
 
-### 12.6 Not yet done / follow-ups
-
-- **The signed-distance regression is not wired on this branch.** `build_frustum_queries`
-  returns `(queries, labels)` only, and `UnifiedTrainer._run_step_img2pcd` calls
-  `frustum_loss_fn(intermediates, labels)` with no `distances`, so `dist_weight` is inert and
-  the head's second channel is trained only through the logit. Section 13 explains why this
-  matters more than it looks. Emit the target from `frustum_labels.py` and pass it through.
-- Replicate the dataset change in `rgbdscenes.py` (and the joint collate
-  `JointTrainingCollateFn._prepare_img2pcd`) if those loaders are used. Note the intrinsics
-  rescale in `sevenscenes_hard.py` / `rgbdscenes.py` scales `fx, cx` by the *height* ratio and
+- **The signed-distance regression is now wired** (VAPE plan M2): `build_frustum_queries`
+  returns `(queries, labels, distances)`, the trainer threads `frustum_distances`, and
+  `FrustumClassificationLoss` *raises* without them — with the logit branch detached, BCE
+  reaches only the temperature, so dropping the regression would leave the head's trunk
+  with zero gradient (measured). Section 13 explains why this matters.
+- **Intrinsics rescale axis swap — still live, still latent.** The rescale in
+  `sevenscenes_hard.py` / `rgbdscenes.py` scales `fx, cx` by the *height* ratio and
   `fy, cy` by the *width* ratio; the axes are swapped. It cancels for 7Scenes (640×480 →
-  384×512, both 0.8) but will corrupt frustum labels on any non-aspect-preserving resize.
-- Add a validation metric (precision/recall/F1, boundary-band recall) in
-  `UnifiedTrainer.evaluate`.
-- Downstream `L_z(T)` consistency term for calibration (Section 1.3) lives in the calibration
-  codebase, not here.
+  384×512, both 0.8) but will corrupt correspondences and frustum labels on any
+  non-aspect-preserving resize. Only the dormant in-fork recipe is exposed to it; VAPE's
+  own `scale_intrinsics` is correct. Fix before reviving the recipe.
+- **Validation metrics exist in VAPE, not here.** `UnifiedTrainer.evaluate` still reports
+  matching EPE only. Boundary-band accuracy/MAE (pooled counts, class-balanced form) live
+  in `vape/models/vape/frustum/{step,band}.py`; the 66-scene end-to-end pose validation is
+  `vape.cli.validate`.
+- **The `L_z(T)` consistency term** (Section 1.3) is implemented in VAPE as
+  `vape/models/vape/frustum/consistency.py`, using metric half-space distances rather than
+  normalised pixel margins (VAPE plan M3).
 
 ---
 
