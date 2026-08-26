@@ -5,6 +5,7 @@ Author: Yuanwen Yue (yuayue@ethz.ch)
 Please cite our work if the code is helpful to you.
 """
 
+import copy
 from functools import partial
 from addict import Dict
 import torch
@@ -12,6 +13,7 @@ import torch.nn as nn
 import spconv.pytorch as spconv
 import torch_scatter
 from timm.layers import DropPath
+from torch.utils.checkpoint import checkpoint
 
 try:
     import flash_attn
@@ -25,6 +27,7 @@ from ..blocks.point_transformer_v3 import (
     PointSequential,
     offset2bincount,
 )
+from ..grad_ckpt import grad_checkpointing_enabled
 from .build import ENCODER_REGISTRY
 from .point_transformer_v3 import DEFAULT_ORDER
 
@@ -381,6 +384,23 @@ class Block(PointModule):
             )
 
     def forward(self, point: Point):
+        if (
+            grad_checkpointing_enabled()
+            and self.training
+            and torch.is_grad_enabled()
+            and point.feat.requires_grad
+        ):
+            return checkpoint(self._forward_copy, point, point.feat, use_reentrant=False)
+        return self._forward(point)
+
+    def _forward_copy(self, point: Point, feat):
+        # Recompute from a shallow copy (the block reassigns keys on its input Point); the
+        # feature tensor argument makes the checkpoint restore the CUDA RNG for DropPath.
+        point = copy.copy(point)
+        point.feat = feat
+        return self._forward(point)
+
+    def _forward(self, point: Point):
         if self.enable_conv:
             shortcut = point.feat
             point = self.conv(point)

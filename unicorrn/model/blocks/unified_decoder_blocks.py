@@ -8,6 +8,11 @@ from .point_transformer_v3 import offset2bincount
 from .utils import batch2offset, offset2batch
 
 
+def _attention(q, k, v, p):
+    """Memory-efficient attention with q/k cast to the value dtype (autocast-safe)."""
+    return memory_efficient_attention(q.to(v.dtype), k.to(v.dtype), v, p=p)
+
+
 class MMEfficientAttention(nn.Module):
     """
     Multi-Modal (MM) Efficient Self Attention block
@@ -40,16 +45,17 @@ class MMEfficientAttention(nn.Module):
 
     @torch.no_grad()
     def get_pos(self, point, order):
-        pos_key = f"pos_{self.order_index}"
+        # Voxel positions: the scale the released fusion weights were trained with.
+        pos_key = f"pos_grid_{self.order_index}_{self.patch_size}"
         if pos_key not in point.keys():
-            point[pos_key] = point.coord[order]
+            point[pos_key] = point.grid_coord[order]
         return point[pos_key]
 
     @torch.no_grad()
     def get_padding_and_inverse(self, point):
-        pad_key = "pad"
-        unpad_key = "unpad"
-        cu_seqlens_key = "cu_seqlens_key"
+        pad_key = f"pad_{self.patch_size}"
+        unpad_key = f"unpad_{self.patch_size}"
+        cu_seqlens_key = f"cu_seqlens_{self.patch_size}"
         if (
             pad_key not in point.keys()
             or unpad_key not in point.keys()
@@ -121,7 +127,7 @@ class MMEfficientAttention(nn.Module):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        x = memory_efficient_attention(q, k, v, p=self.attn_drop)
+        x = _attention(q, k, v, self.attn_drop)
         x = x.reshape([B, N, C])
 
         x = self.proj(x)
@@ -156,7 +162,7 @@ class MMEfficientAttention(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
-        feat = memory_efficient_attention(q, k, v, p=self.attn_drop)
+        feat = _attention(q, k, v, self.attn_drop)
         feat = feat.reshape(-1, C)
 
         feat = feat[inverse]
@@ -213,7 +219,7 @@ class MMEfficientCrossAttention(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
 
-        x = memory_efficient_attention(q, k, v, p=self.attn_drop)
+        x = _attention(q, k, v, self.attn_drop)
         x = x.reshape([B, Nq, C])
 
         x = self.proj(x)
@@ -260,7 +266,7 @@ class MMEfficientCrossAttention(nn.Module):
             k_i = k_i.permute(0, 2, 1, 3)
             v_i = v_i.permute(0, 2, 1, 3)
 
-            x.append(memory_efficient_attention(q_i, k_i, v_i, p=self.attn_drop))
+            x.append(_attention(q_i, k_i, v_i, self.attn_drop))
 
         x = torch.vstack(x)
         x = x.reshape([B, Nq, C])
@@ -305,7 +311,7 @@ class MMEfficientCrossAttention(nn.Module):
             k_i = k_i.permute(0, 2, 1, 3)
             v_i = v_i.permute(0, 2, 1, 3)
 
-            output = memory_efficient_attention(q_i, k_i, v_i, p=self.attn_drop)
+            output = _attention(q_i, k_i, v_i, self.attn_drop)
             x.append(output.reshape(1, Nq, C))
 
         x = batch2offset(x)  # (Npoints, C)
@@ -347,7 +353,7 @@ class MMEfficientCrossAttention(nn.Module):
             q_i = q_i.permute(0, 2, 1, 3)
             k_i = k_i.permute(0, 2, 1, 3)
 
-            output = memory_efficient_attention(q_i, k_i, v_i, p=self.attn_drop)
+            output = _attention(q_i, k_i, v_i, self.attn_drop)
             x.append(output.reshape(1, Nq, C))
 
         x = batch2offset(x)

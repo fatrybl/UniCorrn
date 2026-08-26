@@ -309,5 +309,7 @@ class InvertibleLinearPositionEmbedding(nn.Module):
         return self.position_encoder(pos)
 
     def decode(self, feat):
-        W_inv = torch.pinverse(self.position_encoder.weight)
-        return (feat - self.position_encoder.bias) @ W_inv.T
+        # pinverse has no low-precision kernel; the decode stays fp32 under autocast.
+        with torch.autocast(device_type=feat.device.type, enabled=False):
+            W_inv = torch.pinverse(self.position_encoder.weight)
+            return (feat.float() - self.position_encoder.bias) @ W_inv.T

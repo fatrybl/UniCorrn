@@ -6,6 +6,7 @@ Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
+import copy
 import sys
 from functools import partial
 from addict import Dict
@@ -15,10 +16,15 @@ import torch.nn as nn
 import spconv.pytorch as spconv
 import torch_scatter
 from timm.layers import DropPath
+from torch.utils.checkpoint import checkpoint
 from xformers.ops import memory_efficient_attention, unbind, fmha
+
+from ..grad_ckpt import grad_checkpointing_enabled
 
 from collections import OrderedDict
 from ..embedder import RoPE3D
+
+SERIALIZATION_DEPTH = 16
 
 try:
     import flash_attn
@@ -101,9 +107,10 @@ class Point(Dict):
             ).int()
 
         if depth is None:
-            # Adaptive measure the depth of serialization cube (length = 2 ^ depth)
-            depth = int(self.grid_coord.max()).bit_length()
+            # Constant depth: a cloud's order must not depend on its batch-mates' extent.
+            depth = SERIALIZATION_DEPTH
         self["serialized_depth"] = depth
+        assert int(self.grid_coord.max()).bit_length() <= depth
         # Maximum bit length for serialization code is 63 (int64)
         assert depth * 3 + len(self.offset).bit_length() <= 63
         # Here we follow OCNN and set the depth limitation to 16 (48bit) for the point position.
@@ -393,9 +400,9 @@ class SerializedAttention(PointModule):
 
     @torch.no_grad()
     def get_padding_and_inverse(self, point):
-        pad_key = "pad"
-        unpad_key = "unpad"
-        cu_seqlens_key = "cu_seqlens_key"
+        pad_key = f"pad_{self.patch_size}"
+        unpad_key = f"unpad_{self.patch_size}"
+        cu_seqlens_key = f"cu_seqlens_{self.patch_size}"
         if (
                 pad_key not in point.keys()
                 or unpad_key not in point.keys()
@@ -538,7 +545,7 @@ class SerializedAttentionRoPE(SerializedAttention):
 
     @torch.no_grad()
     def get_pos(self, point, order):
-        pos_key = f"pos_{self.order_index}"
+        pos_key = f"pos_{self.order_index}_{self.patch_size}"
         if pos_key not in point.keys():
             point[pos_key] = point.grid_coord[order]
         return point[pos_key]
@@ -587,7 +594,7 @@ class SerializedAttentionRoPE(SerializedAttention):
             q = q.permute(0, 2, 1, 3)
             k = k.permute(0, 2, 1, 3)
             v = v.permute(0, 2, 1, 3)
-            feat = memory_efficient_attention(q, k, v)
+            feat = memory_efficient_attention(q.to(v.dtype), k.to(v.dtype), v)
             feat = feat.reshape(-1, C)
         else:
             # (total, 3, nheads, headdim)
@@ -706,6 +713,23 @@ class Block(PointModule):
         )
 
     def forward(self, point: Point):
+        if (
+            grad_checkpointing_enabled()
+            and self.training
+            and torch.is_grad_enabled()
+            and point.feat.requires_grad
+        ):
+            return checkpoint(self._forward_copy, point, point.feat, use_reentrant=False)
+        return self._forward(point)
+
+    def _forward_copy(self, point: Point, feat):
+        # Recompute from a shallow copy (the block reassigns keys on its input Point); the
+        # feature tensor argument makes the checkpoint restore the CUDA RNG for DropPath.
+        point = copy.copy(point)
+        point.feat = feat
+        return self._forward(point)
+
+    def _forward(self, point: Point):
         shortcut = point.feat
         point = self.cpe(point)
         point.feat = shortcut + point.feat
