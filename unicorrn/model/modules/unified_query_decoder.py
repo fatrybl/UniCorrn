@@ -19,6 +19,7 @@ from ..grad_ckpt import grad_checkpointing_enabled
 
 from ...utils.config import configurable
 from ..blocks import DualStreamQueryDecoderBlock, FrustumHead, GaussianKNNSample, Mlp
+from ..blocks.query_consensus import QueryConsensus
 from ..blocks.utils import freeze_modules, offset2batch
 from ..embedder import InvertibleLinearPositionEmbedding
 from .build import DECODER_REGISTRY
@@ -111,6 +112,9 @@ class QueryMatchingDecoder(nn.Module):
         self.info_embed = Mlp(project_dim, hidden_features=project_dim, out_features=1)
         self.frustum_head = FrustumHead(project_dim, pos_embed_dim, coord_dim=2)
         self.last_layer_res_only = last_layer_res_only
+        self.consensus = nn.ModuleList(
+            [QueryConsensus(project_dim, num_heads) for _ in range(dec_depth)]
+        )
 
     def freeze_2d_weights(self):
         freeze_modules(
@@ -179,6 +183,21 @@ class QueryMatchingDecoder(nn.Module):
         desc = torch.stack(desc)
         return desc
 
+    @staticmethod
+    def _unpack(ret, has_gm):
+        """``(q, hidden_state, gm, stats)`` from a block's return; the FA block appends
+        statistics, the xformers block does not."""
+        rest = list(ret[2:])
+        gm = rest.pop(0) if has_gm else None
+        return ret[0], ret[1], gm, rest[0] if rest else None
+
+    @staticmethod
+    def _border(patch_coord_map):
+        """Image tokens on the outer patch ring: per-axis coordinate minimum or maximum."""
+        lo = patch_coord_map.amin(dim=1, keepdim=True)
+        hi = patch_coord_map.amax(dim=1, keepdim=True)
+        return ((patch_coord_map == lo) | (patch_coord_map == hi)).any(dim=-1)
+
     def forward_img_to_img(
         self,
         src_feat,
@@ -232,12 +251,9 @@ class QueryMatchingDecoder(nn.Module):
                 img_query=True,
                 gm_res=gm_res_,
             )
-
-            if len(ret) == 3:
-                q, hidden_state, gm_tgt = ret
+            q, hidden_state, gm_tgt, _ = self._unpack(ret, gm_res_ is not None)
+            if gm_tgt is not None:
                 gm_out.append(gm_tgt[..., :2])
-            else:
-                q, hidden_state = ret
 
         corr = self.corr_embed_2d(hidden_state)
         info = self.info_embed(q)
@@ -317,9 +333,11 @@ class QueryMatchingDecoder(nn.Module):
         query_pos,
         patch_coord_map,
         target_pos=None,
+        consensus=False,
         **kwargs,
     ):
-        """Decode 3D point queries against image memory.
+        """Decode 3D point queries against image memory; ``consensus`` lets the queries
+        attend to each other before every readout.
 
         Returns a 7-tuple: ``(corr, info, frustum_out, q, src_desc, tgt_desc, gm_out)``.
         """
@@ -347,6 +365,7 @@ class QueryMatchingDecoder(nn.Module):
         gm_res = torch.cat([patch_coord_map, _padding], dim=-1)
         gm_out = []
         frustum_out = []
+        border = self._border(patch_coord_map)
 
         for idx, block in enumerate(self.query_decoder_blocks):
             gm_res_ = None
@@ -366,17 +385,18 @@ class QueryMatchingDecoder(nn.Module):
                 hidden_state,
                 img_query=False,
                 gm_res=gm_res_,
+                border=border,
             )
-            if len(ret) == 3:
-                q, hidden_state, gm_tgt = ret
+            q, hidden_state, gm_tgt, stats = self._unpack(ret, gm_res_ is not None)
+            if consensus:
+                q = _ckpt(self.training, self.consensus[idx], q, query_pos)
+            if gm_tgt is not None:
                 gm_out.append(gm_tgt[..., :2])
                 frustum_out.append(
                     self.frustum_head(
-                        q, hidden_state, gm_tgt[..., :2], self.corr_embed_2d(hidden_state)
+                        q, hidden_state, gm_tgt[..., :2], self.corr_embed_2d(hidden_state), stats
                     )
                 )
-            else:
-                q, hidden_state = ret
 
         corr = self.corr_embed_2d(hidden_state)
         info = self.info_embed(q)

@@ -1,10 +1,41 @@
+import math
+
 import torch
 import torch.nn as nn
 
 from ..embedder import RoPE2D_Continuous, RoPE3D
 from .blocks import DropPath, Mlp
-from .kernel_attention import gaussian_flash_attn
+from .kernel_attention import gaussian_flash_attn, gaussian_logits
 from .utils import freeze_modules, offset2batch
+
+
+_SLOT_BIAS_INIT = -10.0
+_SLOT_COORD = 0.5
+
+
+def attention_statistics(q, k, k_bias, border):
+    """Per-query existence cues from the attention distribution, mean over heads:
+    ``(slot mass, max image-token probability, normalised entropy, border mass)``.
+
+    Args:
+        q: Queries ``(B, Nq, H, C)``.
+        k: Keys with the slot last ``(B, Nk + 1, H, C)``.
+        k_bias: Key logit biases ``(B, H, Nk + 1)``.
+        border: Image tokens on the outer patch ring ``(B, Nk)``.
+    """
+    prob = torch.softmax(gaussian_logits(q, k, k_bias).float(), dim=-1)
+    image = prob[..., :-1]
+    entropy = -(prob * torch.log(prob.clamp_min(torch.finfo(prob.dtype).tiny))).sum(-1)
+    stats = torch.stack(
+        [
+            prob[..., -1],
+            image.amax(-1),
+            entropy / math.log(prob.shape[-1]),
+            (image * border[:, None, None, :]).sum(-1),
+        ],
+        dim=-1,
+    )
+    return stats.mean(dim=1)
 
 
 def _merge_heads(attn_out, batch, length, channels):
@@ -34,6 +65,12 @@ class DualStreamCrossAttentionFA(nn.Module):
 
         self.projv = nn.Linear(dim, dim, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
+        # A learned "no match" key/value: its logit bias starts far below any image token,
+        # so the pretrained attention is unchanged until training raises it.
+        self.slot_key = nn.Parameter(torch.zeros(dim))
+        self.slot_value = nn.Parameter(torch.zeros(dim))
+        self.slot_res = nn.Parameter(torch.zeros(res_dim))
+        self.slot_bias = nn.Parameter(torch.full((num_heads,), _SLOT_BIAS_INIT))
 
     def forward_query_to_img(
         self,
@@ -46,12 +83,14 @@ class DualStreamCrossAttentionFA(nn.Module):
         img_query,
         appearance_only=False,
         gm_res=None,
+        border=None,
     ):
         B, Nq, C = query.shape
         Nk = key.shape[1]
         assert value.shape[:-1] == res.shape[:-1]
         Nv = value.shape[1]
         Cres = res.shape[-1]
+        H = self.num_heads
 
         q = (
             self.projq(query)
@@ -75,27 +114,38 @@ class DualStreamCrossAttentionFA(nn.Module):
         # (batch_size, seqlen, nheads, headdim)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
-
+        v = self.projv(value).reshape(B, Nv, H, C // H)
+        # The slot joins every stream as one more key; its bias rides in the kernel.
+        k = torch.cat([k, self.slot_key.view(1, 1, H, C // H).expand(B, 1, H, C // H)], dim=1)
+        v = torch.cat([v, self.slot_value.view(1, 1, H, C // H).expand(B, 1, H, C // H)], dim=1)
+        res = torch.cat(
+            [res, self.slot_res.view(1, 1, H, Cres // H).expand(B, 1, H, Cres // H)], dim=1
+        )
+        k_bias = torch.cat(
+            [torch.zeros(B, H, Nk, device=q.device), self.slot_bias.view(1, H, 1).expand(B, H, 1)],
+            dim=-1,
+        )
         # Attention Stream 1 : appearance features
-        v = self.projv(value).reshape(B, Nv, self.num_heads, C // self.num_heads)
-        x = _merge_heads(gaussian_flash_attn(q, k, v, dropout_p=self.attn_drop), B, Nq, C)
+        x = _merge_heads(gaussian_flash_attn(q, k, v, k_bias, dropout_p=self.attn_drop), B, Nq, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         # Attention Stream 2 : position features
         res_out = _merge_heads(
-            gaussian_flash_attn(q, k, res, dropout_p=self.attn_drop), B, Nq, Cres
+            gaussian_flash_attn(q, k, res, k_bias, dropout_p=self.attn_drop), B, Nq, Cres
         )
         res_out = self.proj_res(res_out)
         res_out = self.proj_drop(res_out)
+        stats = attention_statistics(q, k, k_bias, border) if border is not None else None
         # (Optional) Attention Stream 3 : GM raw coordinates
         if gm_res is not None:
-            gm_res = gm_res.reshape(B, Nv, self.num_heads, 4 // self.num_heads)
+            slot_gm = gm_res.new_full((B, 1, 4), _SLOT_COORD)
+            slot_gm[..., 2:] = 0.0
+            gm_res = torch.cat([gm_res, slot_gm], dim=1).reshape(B, Nv + 1, H, 4 // H)
             gm_out = _merge_heads(
-                gaussian_flash_attn(q, k, gm_res, dropout_p=self.attn_drop), B, Nq, 4
+                gaussian_flash_attn(q, k, gm_res, k_bias, dropout_p=self.attn_drop), B, Nq, 4
             )
-            return x, res_out, gm_out
-
-        return x, res_out
+            return x, res_out, gm_out, stats
+        return x, res_out, stats
 
     def forward_query_to_pcd(
         self,
@@ -251,7 +301,7 @@ class DualStreamQueryDecoderBlockFA(nn.Module):
         )
 
     def forward_query_to_img(
-        self, tgt, mem, kpos, res, hidden_state, img_query, gm_res=None
+        self, tgt, mem, kpos, res, hidden_state, img_query, gm_res=None, border=None
     ):
         tgt = self.norm_tgt(tgt)
         mem = self.norm_mem(mem)
@@ -274,11 +324,12 @@ class DualStreamQueryDecoderBlockFA(nn.Module):
             img_query=img_query,
             appearance_only=self.init,
             gm_res=gm_res,
+            border=border,
         )
         if gm_res is not None:
-            tgt2, hidden_tgt, gm_tgt = ret
+            tgt2, hidden_tgt, gm_tgt, stats = ret
         else:
-            tgt2, hidden_tgt = ret
+            tgt2, hidden_tgt, stats = ret
 
         # Update
         if not self.init:
@@ -295,8 +346,8 @@ class DualStreamQueryDecoderBlockFA(nn.Module):
         tgt = tgt + self.drop_path(self.mlp_tgt(tgt))
 
         if gm_res is not None:
-            return tgt, hidden_state, gm_tgt
-        return tgt, hidden_state
+            return tgt, hidden_state, gm_tgt, stats
+        return tgt, hidden_state, stats
 
     def forward_query_to_pcd(
         self, tgt, mem, kpos, mem_offsets, res, hidden_state, img_query, gm_res=None

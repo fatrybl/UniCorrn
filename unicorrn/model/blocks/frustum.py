@@ -52,6 +52,7 @@ from torch import Tensor, nn
 
 _N_MARGINS = 3
 _N_OFFSET = 2
+_N_STATS = 4
 _BOX_CENTRE = 0.5
 _NORM_EPS = 1e-12
 _INIT_LOG_SCALE = 0.0
@@ -80,6 +81,15 @@ class FrustumHead(nn.Module):
         self.trunk = nn.Sequential(*layers)
         self.distance = nn.Linear(feat_dim, 1)
         self.log_scale = nn.Parameter(torch.full((), _INIT_LOG_SCALE))
+        # Attention statistics enter through a zero-initialised projection, so a head
+        # trained without them is reproduced exactly at load.
+        self.stats = nn.Linear(_N_STATS, feat_dim)
+        nn.init.zeros_(self.stats.weight)
+        nn.init.zeros_(self.stats.bias)
+        # An unbounded projection regressor; its box distance feeds ``d`` through a gain
+        # that starts at zero, so the readout is unchanged until the regressor is trained.
+        self.projection = nn.Linear(feat_dim, coord_dim)
+        self.sdf_gain = nn.Parameter(torch.zeros(()))
 
     @staticmethod
     def signed_distance(projection: Tensor) -> Tensor:
@@ -100,18 +110,23 @@ class FrustumHead(nn.Module):
         position: Tensor,
         projection: Tensor,
         free_projection: Tensor,
+        stats: Tensor | None = None,
     ) -> Tensor:
-        """Predict the in/out logit and signed boundary distance per query.
+        """Predict the in/out logit, signed boundary distance and unbounded projection.
 
         The logit is the detached distance scaled by the learnable inverse temperature,
-        so the two returned channels share a sign, the probability is a level-set of the
-        distance field, and the classification loss trains only the temperature.
+        so the first two channels share a sign, the probability is a level-set of the
+        distance field, and the classification loss trains only the temperature. The last
+        two channels are the regressed image coordinates, supervised on every query in
+        front of the camera, inside the frame or not.
 
         Args:
             appearance: Decoder appearance stream.
             position: Decoder position stream.
             projection: Attention soft-argmax image coordinates.
             free_projection: Correspondence decode of the position stream.
+            stats: Attention existence cues ``[..., 4]`` (slot mass, max probability,
+                normalised entropy, border mass); ``None`` when the kernel has none.
         """
         axis_margins = _BOX_CENTRE - torch.abs(free_projection - _BOX_CENTRE)
         features = torch.cat(
@@ -126,5 +141,10 @@ class FrustumHead(nn.Module):
             ],
             dim=-1,
         )
-        distance = self.distance(self.trunk(features))
-        return torch.cat([distance.detach() * self.log_scale.exp(), distance], dim=-1)
+        hidden = self.trunk[0](features)
+        if stats is not None:
+            hidden = hidden + self.stats(stats.to(hidden.dtype))
+        hidden = self.trunk[1:](hidden)
+        unbounded = self.projection(hidden)
+        distance = self.distance(hidden) + self.sdf_gain * self.signed_distance(unbounded)
+        return torch.cat([distance.detach() * self.log_scale.exp(), distance, unbounded], dim=-1)

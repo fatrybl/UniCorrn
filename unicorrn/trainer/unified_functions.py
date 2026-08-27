@@ -67,13 +67,17 @@ class FrustumClassificationLoss:
         focal = (1 - torch.where(labels > 0.5, p, 1 - p)) ** self.focal_gamma
         return (focal * ce).mean()
 
-    def __call__(self, frustum_intermediates, labels, distances, **kwargs):
-        """Compute γ-decayed focal BCE and signed-distance regression over all readouts.
+    def __call__(self, frustum_intermediates, labels, distances, projections=None, front=None):
+        """Compute γ-decayed focal BCE, signed-distance and projection regression over all
+        readouts.
 
         Args:
-            frustum_intermediates: Per-layer readouts holding logit and signed distance.
+            frustum_intermediates: Per-layer readouts holding logit, signed distance and
+                the regressed projection.
             labels: Ground-truth in/out membership.
             distances: Ground-truth signed boundary distances.
+            projections: Ground-truth normalised image projections, unbounded.
+            front: Mask of queries in front of the camera, where ``projections`` hold.
 
         Raises:
             ValueError: If distances are missing. Since the head detaches the distance on
@@ -84,7 +88,7 @@ class FrustumClassificationLoss:
             raise ValueError("FrustumClassificationLoss requires signed-distance targets")
         labels = labels.float()
         num_layers = len(frustum_intermediates)
-        loss, cls_loss, dist_loss = 0.0, 0.0, 0.0
+        loss, cls_loss, dist_loss, proj_loss = 0.0, 0.0, 0.0, 0.0
         for idx in range(num_layers):
             decay = self.gamma ** (num_layers - idx - 1)
             layer = frustum_intermediates[idx]
@@ -96,10 +100,17 @@ class FrustumClassificationLoss:
             )
             dist_loss = dist_loss + layer_dist
             loss = loss + decay * layer_dist
+            if projections is not None and bool(front.any()):
+                layer_proj = F.smooth_l1_loss(
+                    layer[..., 2:][front], projections[front].float(), beta=self.huber_beta
+                )
+                proj_loss = proj_loss + layer_proj
+                loss = loss + decay * layer_proj
         return loss, {
             "frustum_loss": loss.item() if torch.is_tensor(loss) else loss,
             "frustum_cls": cls_loss.item() if torch.is_tensor(cls_loss) else cls_loss,
             "frustum_dist": dist_loss.item() if torch.is_tensor(dist_loss) else dist_loss,
+            "frustum_proj": proj_loss.item() if torch.is_tensor(proj_loss) else proj_loss,
         }
 
 

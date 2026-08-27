@@ -187,7 +187,12 @@ class UniCorrn(nn.Module):
     def _frustum_pcd_to_img(self, point, img_feat, query_pos, patch_coord_map):
         """Classify extra 3D queries as in/out camera frustum, reusing encoded features."""
         frustum_out = self.decoder.forward_pcd_to_img(
-            point.feat, point, img_feat, query_pos, patch_coord_map=patch_coord_map
+            point.feat,
+            point,
+            img_feat,
+            query_pos,
+            patch_coord_map=patch_coord_map,
+            consensus=True,
         )[2]
         return frustum_out[-1], frustum_out
 

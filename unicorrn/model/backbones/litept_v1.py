@@ -400,10 +400,21 @@ class Block(PointModule):
         point.feat = feat
         return self._forward(point)
 
+    def _sparse_conv(self, point: Point):
+        # spconv's inference path has no half-precision kernel for this convolution, so
+        # under an outer autocast eval runs it in fp32 (the conv reads the cached sparse
+        # tensor, which is re-wrapped too); training is untouched.
+        if self.training:
+            return self.conv(point)
+        with torch.autocast(device_type=point.feat.device.type, enabled=False):
+            point.feat = point.feat.float()
+            point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
+            return self.conv(point)
+
     def _forward(self, point: Point):
         if self.enable_conv:
             shortcut = point.feat
-            point = self.conv(point)
+            point = self._sparse_conv(point)
             point.feat = shortcut + point.feat
         else:
             point = self.norm0(point)

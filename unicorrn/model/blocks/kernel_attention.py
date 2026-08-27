@@ -54,20 +54,48 @@ def gaussian_memory_efficient_attn(q, k, v, **kwargs):
     return attn_out
 
 
-def gaussian_flash_attn(q, k, v, **kwargs):
+def gaussian_augment(q, k, k_bias=None):
+    """Augmented (q', k') whose scaled dot product is -|q - k|^2 / C plus an optional
+    per-key bias, carried in the first spare filler dim (q' gets 1, k' gets bias * C).
+
+    Args:
+        q: Queries ``(B, H, Nq, C)``.
+        k: Keys ``(B, H, Nk, C)``.
+        k_bias: Optional additive key logits ``(B, H, Nk)``.
+    """
+    q_norm = torch.sum(q ** 2, dim=-1, dtype=q.dtype, keepdim=True)
+    k_norm = torch.sum(k ** 2, dim=-1, dtype=k.dtype, keepdim=True)
+    q_filler = torch.zeros(*q_norm.shape[:-1], 6, dtype=q.dtype, device=q.device)
+    k_filler = torch.zeros(*k_norm.shape[:-1], 6, dtype=k.dtype, device=k.device)
+    if k_bias is not None:
+        q_filler[..., 0] = 1.0
+        k_filler[..., 0] = k_bias.to(k.dtype) * q.shape[-1]
+    q_prime = torch.cat([2.0 * q, torch.ones_like(q_norm), -q_norm, q_filler], dim=-1)
+    k_prime = torch.cat([k, -k_norm, torch.ones_like(k_norm), k_filler], dim=-1)
+    return q_prime, k_prime
+
+
+def gaussian_logits(q, k, k_bias=None):
+    """The kernel's attention logits ``(B, H, Nq, Nk)``, materialised (statistics only).
+
+    Args:
+        q: Queries ``(B, Nq, H, C)``.
+        k: Keys ``(B, Nk, H, C)``.
+        k_bias: Optional additive key logits ``(B, H, Nk)``.
+    """
+    q_prime, k_prime = gaussian_augment(q.transpose(1, 2), k.transpose(1, 2), k_bias)
+    return torch.matmul(q_prime, k_prime.transpose(-1, -2)) / q.shape[-1]
+
+
+def gaussian_flash_attn(q, k, v, k_bias=None, **kwargs):
     # B, num_seq, H, C_ -> B, H, num_seq, C_
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
 
-    q_norm = torch.sum(q ** 2, dim=-1, dtype=q.dtype, keepdim=True)
-    k_norm = torch.sum(k ** 2, dim=-1, dtype=k.dtype, keepdim=True)
-    q_filler = torch.zeros(*q_norm.shape[:-1], 6, dtype=q.dtype, device=q.device)
-    k_filler = torch.zeros(*k_norm.shape[:-1], 6, dtype=k.dtype, device=k.device)
     v_padding = q.shape[-1] - v.shape[-1] + 8
     v_filler = torch.zeros(*v.shape[:-1], v_padding, dtype=v.dtype, device=v.device)
-    q_prime = torch.cat([2.0 * q, torch.ones_like(q_norm), -q_norm, q_filler], dim=-1)
-    k_prime = torch.cat([k, -k_norm, torch.ones_like(k_norm), k_filler], dim=-1)
+    q_prime, k_prime = gaussian_augment(q, k, k_bias)
     attn_out = flash_attention(
         q_prime,
         k_prime,
