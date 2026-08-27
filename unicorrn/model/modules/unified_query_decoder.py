@@ -19,7 +19,6 @@ from ..grad_ckpt import grad_checkpointing_enabled
 
 from ...utils.config import configurable
 from ..blocks import DualStreamQueryDecoderBlock, FrustumHead, GaussianKNNSample, Mlp
-from ..blocks.query_consensus import QueryConsensus
 from ..blocks.utils import freeze_modules, offset2batch
 from ..embedder import InvertibleLinearPositionEmbedding
 from .build import DECODER_REGISTRY
@@ -112,9 +111,6 @@ class QueryMatchingDecoder(nn.Module):
         self.info_embed = Mlp(project_dim, hidden_features=project_dim, out_features=1)
         self.frustum_head = FrustumHead(project_dim, pos_embed_dim, coord_dim=2)
         self.last_layer_res_only = last_layer_res_only
-        self.consensus = nn.ModuleList(
-            [QueryConsensus(project_dim, num_heads) for _ in range(dec_depth)]
-        )
 
     def freeze_2d_weights(self):
         freeze_modules(
@@ -333,11 +329,10 @@ class QueryMatchingDecoder(nn.Module):
         query_pos,
         patch_coord_map,
         target_pos=None,
-        consensus=False,
         **kwargs,
     ):
-        """Decode 3D point queries against image memory; ``consensus`` lets the queries
-        attend to each other before every readout.
+        """Decode 3D point queries against image memory; every readout is per query, so
+        the frustum head sees the same inputs whichever query set a pass carries.
 
         Returns a 7-tuple: ``(corr, info, frustum_out, q, src_desc, tgt_desc, gm_out)``.
         """
@@ -388,8 +383,6 @@ class QueryMatchingDecoder(nn.Module):
                 border=border,
             )
             q, hidden_state, gm_tgt, stats = self._unpack(ret, gm_res_ is not None)
-            if consensus:
-                q = _ckpt(self.training, self.consensus[idx], q, query_pos)
             if gm_tgt is not None:
                 gm_out.append(gm_tgt[..., :2])
                 frustum_out.append(

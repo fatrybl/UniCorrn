@@ -192,7 +192,6 @@ class UniCorrn(nn.Module):
             img_feat,
             query_pos,
             patch_coord_map=patch_coord_map,
-            consensus=True,
         )[2]
         return frustum_out[-1], frustum_out
 

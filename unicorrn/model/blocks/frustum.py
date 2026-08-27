@@ -125,7 +125,7 @@ class FrustumHead(nn.Module):
             position: Decoder position stream.
             projection: Attention soft-argmax image coordinates.
             free_projection: Correspondence decode of the position stream.
-            stats: Attention existence cues ``[..., 4]`` (slot mass, max probability,
+            stats: Attention existence cues ``[..., 4]`` (slot mass, expected logit,
                 normalised entropy, border mass); ``None`` when the kernel has none.
         """
         axis_margins = _BOX_CENTRE - torch.abs(free_projection - _BOX_CENTRE)

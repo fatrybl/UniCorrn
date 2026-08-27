@@ -2,20 +2,30 @@ import math
 
 import torch
 import torch.nn as nn
+from flash_attn import flash_attn_func
 
 from ..embedder import RoPE2D_Continuous, RoPE3D
 from .blocks import DropPath, Mlp
-from .kernel_attention import gaussian_flash_attn, gaussian_logits
+from .kernel_attention import gaussian_augment, gaussian_flash_attn
 from .utils import freeze_modules, offset2batch
 
 
 _SLOT_BIAS_INIT = -10.0
 _SLOT_COORD = 0.5
+_SLOT_CHANNEL, _BORDER_CHANNEL = -5, -4
 
 
+@torch.no_grad()
 def attention_statistics(q, k, k_bias, border):
-    """Per-query existence cues from the attention distribution, mean over heads:
-    ``(slot mass, max image-token probability, normalised entropy, border mass)``.
+    """Per-query existence cues read off the attention distribution, mean over heads:
+    ``(slot mass, expected logit, normalised entropy, border mass)``.
+
+    One flash pass over the augmented keys, with the keys themselves as values and the
+    slot and border indicators in two of the spare filler channels (zero in ``q'``),
+    returns the attention-weighted mean key ``m``, both masses and the log-sum-exp
+    ``L``; the expected logit is ``q'·m / C`` and the entropy ``L − q'·m / C``, so no
+    per-pair quantity is materialised. The cues are observations: no gradient reaches
+    the attention through them.
 
     Args:
         q: Queries ``(B, Nq, H, C)``.
@@ -23,19 +33,30 @@ def attention_statistics(q, k, k_bias, border):
         k_bias: Key logit biases ``(B, H, Nk + 1)``.
         border: Image tokens on the outer patch ring ``(B, Nk)``.
     """
-    prob = torch.softmax(gaussian_logits(q, k, k_bias).float(), dim=-1)
-    image = prob[..., :-1]
-    entropy = -(prob * torch.log(prob.clamp_min(torch.finfo(prob.dtype).tiny))).sum(-1)
+    q_prime, k_prime = gaussian_augment(q.transpose(1, 2), k.transpose(1, 2), k_bias)
+    q_prime, k_prime = q_prime.transpose(1, 2), k_prime.transpose(1, 2)
+    values = k_prime.clone()
+    values[:, -1, :, _SLOT_CHANNEL] = 1.0
+    values[:, :-1, :, _BORDER_CHANNEL] = border[:, :, None].to(values.dtype)
+    out, lse, _ = flash_attn_func(
+        q_prime.bfloat16(),
+        k_prime.bfloat16(),
+        values.bfloat16(),
+        softmax_scale=1.0 / q.shape[-1],
+        return_attn_probs=True,
+    )
+    expected = (q_prime.float() * out.float()).sum(-1) / q.shape[-1]
+    entropy = lse.transpose(1, 2) - expected
     stats = torch.stack(
         [
-            prob[..., -1],
-            image.amax(-1),
-            entropy / math.log(prob.shape[-1]),
-            (image * border[:, None, None, :]).sum(-1),
+            out[..., _SLOT_CHANNEL].float(),
+            expected,
+            entropy / math.log(k.shape[1]),
+            out[..., _BORDER_CHANNEL].float(),
         ],
         dim=-1,
     )
-    return stats.mean(dim=1)
+    return stats.mean(dim=2)
 
 
 def _merge_heads(attn_out, batch, length, channels):

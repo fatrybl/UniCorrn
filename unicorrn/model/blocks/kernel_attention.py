@@ -75,18 +75,6 @@ def gaussian_augment(q, k, k_bias=None):
     return q_prime, k_prime
 
 
-def gaussian_logits(q, k, k_bias=None):
-    """The kernel's attention logits ``(B, H, Nq, Nk)``, materialised (statistics only).
-
-    Args:
-        q: Queries ``(B, Nq, H, C)``.
-        k: Keys ``(B, Nk, H, C)``.
-        k_bias: Optional additive key logits ``(B, H, Nk)``.
-    """
-    q_prime, k_prime = gaussian_augment(q.transpose(1, 2), k.transpose(1, 2), k_bias)
-    return torch.matmul(q_prime, k_prime.transpose(-1, -2)) / q.shape[-1]
-
-
 def gaussian_flash_attn(q, k, v, k_bias=None, **kwargs):
     # B, num_seq, H, C_ -> B, H, num_seq, C_
     q = q.transpose(1, 2)
