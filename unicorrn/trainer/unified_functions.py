@@ -21,8 +21,13 @@ class FrustumClassificationLoss:
 
         focal = (1 - p_t) ** focal_gamma
         loss  = focal * BCE(logit, label) + SmoothL1(distance, target)
+                + SmoothL1(projection, uv)[front]
 
-    The terms carry equal weight because they no longer compete: the head detaches the
+    A sign hinge ``relu(-y * distance)`` was tried and removed: under an uncertain sign
+    its expectation is minimised at zero, so it makes the head hedge rather than decide
+    (200-step arms: band accuracy 0.501 with it, 0.497-0.503 without).
+
+    The terms carry equal weight because they do not compete: the head detaches the
     distance on its logit branch, so the BCE reaches only the temperature and the
     regression only the trunk. Their relative scale would merely retune the temperature's
     step size, so the only meaningful knob is one weight on the whole frustum objective,

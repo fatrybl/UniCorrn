@@ -9,15 +9,17 @@ camera and inside the image extent:
     in_frustum = (z > z_min) and (0 <= u < W) and (0 <= v < H)
 
 Membership is also emitted as a signed distance, so supervision is graded across
-the boundary instead of being a step function of position. For the projection
-normalised to the unit rectangle and ``q = |u - 1/2| - 1/2``,
+the boundary instead of being a step function of position. The frustum is the
+intersection of five half-spaces of the camera frame - the side planes through the
+centre, ``a_i . P_cam >= 0`` for ``a = (fx, 0, cx)``, ``(-fx, 0, W - cx)``,
+``(0, fy, cy)``, ``(0, -fy, H - cy)``, and the near plane ``z - z_min >= 0`` - and the
+target is the angular margin to the nearest face,
 
-    s(u) = -( ||max(q, 0)||_2 + min(max(q_x, q_y), 0) )
+    s(P) = min_i ( a_i . P_cam + b_i ) / (|a_i| * ||P_cam||),
 
-is the exact Euclidean signed distance to that rectangle, positive inside and negative
-outside, clamped so its range stays bounded. Points at or behind ``z_min`` take the
-fully-outside value: their projection is the mirrored image and would otherwise land
-inside the rectangle carrying an out-of-frustum label.
+the sine of the angle to a side plane and the cosine of the polar angle at the near
+plane: positive inside and negative outside with the sign exact everywhere, including
+behind the camera, continuous, bounded and free of any scene scale.
 
 T and K are used here for *labelling only*; the model never receives them as input, so
 the learned classifier stays pose-independent.
@@ -29,8 +31,6 @@ from numpy import ndarray
 from ...utils.vision3d.array_ops import apply_transform, normalize_coord_corr_points
 
 _MIN_DEPTH = 1e-3
-_BOX_CENTRE = 0.5
-_SATURATION = 0.5
 
 
 def _resample(idx: ndarray, n: int) -> ndarray:
@@ -47,21 +47,25 @@ def _resample(idx: ndarray, n: int) -> ndarray:
     return np.random.choice(idx, n, replace=len(idx) < n)
 
 
-def _signed_distance(uv: ndarray, z: ndarray, image_h: int, image_w: int) -> ndarray:
-    """Signed distance of each projection to the image rectangle.
+def _angular_sdf(cam: ndarray, intrinsics: ndarray, image_h: int, image_w: int) -> ndarray:
+    """Angular signed distance of camera-frame points to the frustum (module formula).
 
     Args:
-        uv: Pixel coordinates of the projections.
-        z: Camera-frame depth of the same points.
+        cam: Points in the camera frame.
+        intrinsics: Camera intrinsic matrix in the model's image frame.
         image_h: Image height in pixels.
         image_w: Image width in pixels.
     """
-    normalised = uv / np.array([image_w, image_h], dtype=uv.dtype)
-    q = np.abs(normalised - _BOX_CENTRE) - _BOX_CENTRE
-    outside = np.linalg.norm(np.clip(q, 0.0, None), axis=-1)
-    inside = np.clip(q.max(axis=-1), None, 0.0)
-    distance = np.where(z > _MIN_DEPTH, -(outside + inside), -_SATURATION)
-    return np.clip(distance, -_SATURATION, _SATURATION)
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    normals = np.array(
+        [[fx, 0.0, cx], [-fx, 0.0, image_w - cx], [0.0, fy, cy], [0.0, -fy, image_h - cy], [0.0, 0.0, 1.0]],
+        dtype=cam.dtype,
+    )
+    offsets = np.array([0.0, 0.0, 0.0, 0.0, -_MIN_DEPTH], dtype=cam.dtype)
+    margins = (cam @ normals.T + offsets) / np.linalg.norm(normals, axis=-1)
+    radial = np.maximum(np.linalg.norm(cam, axis=-1), _MIN_DEPTH)
+    return margins.min(axis=-1) / radial
 
 
 def build_frustum_queries(
@@ -75,8 +79,8 @@ def build_frustum_queries(
     """Sample a class-balanced set of point queries with in/out-frustum supervision.
 
     Returns normalised 3D query coordinates (matching the model's point normalisation),
-    float {0, 1} membership labels, and the signed distance of each query's projection
-    to the frustum boundary.
+    float {0, 1} membership labels, and the angular signed distance of each query to the
+    frustum boundary.
 
     Args:
         points: Point cloud in the cloud frame.
@@ -107,5 +111,5 @@ def build_frustum_queries(
 
     queries = normalize_coord_corr_points(points[sel], points).astype(np.float32)
     labels = in_frustum[sel].astype(np.float32)
-    distances = _signed_distance(uv[sel], z[sel], image_h, image_w).astype(np.float32)
+    distances = _angular_sdf(cam[sel], intrinsics, image_h, image_w).astype(np.float32)
     return queries, labels, distances

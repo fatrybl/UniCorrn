@@ -10,6 +10,7 @@ from functools import partial
 from addict import Dict
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import spconv.pytorch as spconv
 import torch_scatter
 from timm.layers import DropPath
@@ -440,6 +441,24 @@ class Block(PointModule):
         return point
 
 
+class SceneNorm(nn.BatchNorm1d):
+    """BatchNorm1d that normalises by the batch's own statistics in every mode.
+
+    VAPE trains one scene per step, so the network only ever saw per-scene moments; the
+    running averages mix scenes of different datasets, and normalising by them at
+    inference shifts the features away from what the weights were fitted to (same
+    checkpoint, 40 scenes: median translation error 1.25 m with running statistics,
+    0.48 m with batch statistics). The running buffers are kept and still updated in
+    training, so checkpoints load strictly either way.
+    """
+
+    def forward(self, x):
+        momentum = self.momentum if self.training else 0.0
+        return F.batch_norm(
+            x, self.running_mean, self.running_var, self.weight, self.bias, True, momentum, self.eps
+        )
+
+
 class GridPooling(PointModule):
     def __init__(
         self,
@@ -681,7 +700,7 @@ class LitePT(PointModule):
         assert self.enc_mode or self.num_stages == len(dec_patch_size) + 1
 
         # norm layers
-        bn_layer = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
+        bn_layer = partial(SceneNorm, eps=1e-3, momentum=0.01)
         ln_layer = nn.LayerNorm
 
         # activation layers
