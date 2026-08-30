@@ -248,7 +248,7 @@ class DualStreamQueryDecoderBlock(nn.Module):
         )
 
     def forward_query_to_img(
-        self, tgt, mem, kpos, res, hidden_state, img_query, gm_res=None, border=None
+        self, tgt, mem, kpos, res, hidden_state, img_query, gm_res=None
     ):
         tgt = self.norm_tgt(tgt)
         mem = self.norm_mem(mem)

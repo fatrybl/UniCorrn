@@ -30,6 +30,10 @@ uncorrelated with the analytic SDF near the boundary (band R² = 1e-4). Making t
 a metric 3D margin — a function of coordinates the head does receive — is the change that
 would make the negative half representable; see ``doc/vape/proposals.md`` P1.
 
+The head also regresses its own image coordinate ``u_hat`` from the trunk, an auxiliary
+readout supervised where the GT projection lies within reach of the frame; it feeds no
+other channel.
+
 The head regresses a single signed distance ``d`` and derives the in/out logit as
 ``d / T`` with one global learnable temperature ``T`` (``logit = d * exp(log_scale)``).
 The two readouts therefore cannot disagree, and the membership probability
@@ -52,7 +56,6 @@ from torch import Tensor, nn
 
 _N_MARGINS = 3
 _N_OFFSET = 2
-_N_STATS = 4
 _BOX_CENTRE = 0.5
 _NORM_EPS = 1e-12
 _INIT_LOG_SCALE = 0.0
@@ -81,15 +84,7 @@ class FrustumHead(nn.Module):
         self.trunk = nn.Sequential(*layers)
         self.distance = nn.Linear(feat_dim, 1)
         self.log_scale = nn.Parameter(torch.full((), _INIT_LOG_SCALE))
-        # Attention statistics enter through a zero-initialised projection, so a head
-        # trained without them is reproduced exactly at load.
-        self.stats = nn.Linear(_N_STATS, feat_dim)
-        nn.init.zeros_(self.stats.weight)
-        nn.init.zeros_(self.stats.bias)
-        # An unbounded projection regressor; its box distance feeds ``d`` through a gain
-        # that starts at zero, so the readout is unchanged until the regressor is trained.
         self.projection = nn.Linear(feat_dim, coord_dim)
-        self.sdf_gain = nn.Parameter(torch.zeros(()))
 
     @staticmethod
     def signed_distance(projection: Tensor) -> Tensor:
@@ -110,23 +105,20 @@ class FrustumHead(nn.Module):
         position: Tensor,
         projection: Tensor,
         free_projection: Tensor,
-        stats: Tensor | None = None,
     ) -> Tensor:
         """Predict the in/out logit, signed boundary distance and unbounded projection.
 
         The logit is the detached distance scaled by the learnable inverse temperature,
         so the first two channels share a sign, the probability is a level-set of the
         distance field, and the classification loss trains only the temperature. The last
-        two channels are the regressed image coordinates, supervised on every query in
-        front of the camera, inside the frame or not.
+        two channels are the regressed image coordinates, an auxiliary readout supervised
+        where the projection lies within reach of the frame.
 
         Args:
             appearance: Decoder appearance stream.
             position: Decoder position stream.
             projection: Attention soft-argmax image coordinates.
             free_projection: Correspondence decode of the position stream.
-            stats: Attention existence cues ``[..., 4]`` (slot mass, expected logit,
-                normalised entropy, border mass); ``None`` when the kernel has none.
         """
         axis_margins = _BOX_CENTRE - torch.abs(free_projection - _BOX_CENTRE)
         features = torch.cat(
@@ -141,10 +133,7 @@ class FrustumHead(nn.Module):
             ],
             dim=-1,
         )
-        hidden = self.trunk[0](features)
-        if stats is not None:
-            hidden = hidden + self.stats(stats.to(hidden.dtype))
-        hidden = self.trunk[1:](hidden)
+        hidden = self.trunk(features)
         unbounded = self.projection(hidden)
-        distance = self.distance(hidden) + self.sdf_gain * self.signed_distance(unbounded)
+        distance = self.distance(hidden)
         return torch.cat([distance.detach() * self.log_scale.exp(), distance, unbounded], dim=-1)

@@ -21,7 +21,7 @@ class FrustumClassificationLoss:
 
         focal = (1 - p_t) ** focal_gamma
         loss  = focal * BCE(logit, label) + SmoothL1(distance, target)
-                + SmoothL1(projection, uv)[front]
+                + SmoothL1(projection, uv)[mask]
 
     A sign hinge ``relu(-y * distance)`` was tried and removed: under an uncertain sign
     its expectation is minimised at zero, so it makes the head hedge rather than decide
@@ -72,7 +72,7 @@ class FrustumClassificationLoss:
         focal = (1 - torch.where(labels > 0.5, p, 1 - p)) ** self.focal_gamma
         return (focal * ce).mean()
 
-    def __call__(self, frustum_intermediates, labels, distances, projections=None, front=None):
+    def __call__(self, frustum_intermediates, labels, distances, projections=None, mask=None):
         """Compute γ-decayed focal BCE, signed-distance and projection regression over all
         readouts.
 
@@ -82,7 +82,8 @@ class FrustumClassificationLoss:
             labels: Ground-truth in/out membership.
             distances: Ground-truth signed boundary distances.
             projections: Ground-truth normalised image projections, unbounded.
-            front: Mask of queries in front of the camera, where ``projections`` hold.
+            mask: Queries whose projection is supervised: in front of the camera and
+                within reach of the frame (the perspective pole past it has no target).
 
         Raises:
             ValueError: If distances are missing. Since the head detaches the distance on
@@ -105,9 +106,9 @@ class FrustumClassificationLoss:
             )
             dist_loss = dist_loss + layer_dist
             loss = loss + decay * layer_dist
-            if projections is not None and bool(front.any()):
+            if projections is not None and bool(mask.any()):
                 layer_proj = F.smooth_l1_loss(
-                    layer[..., 2:][front], projections[front].float(), beta=self.huber_beta
+                    layer[..., 2:][mask], projections[mask].float(), beta=self.huber_beta
                 )
                 proj_loss = proj_loss + layer_proj
                 loss = loss + decay * layer_proj
