@@ -11,7 +11,7 @@
 
 <a href="https://arxiv.org/abs/2605.04044"><img src="https://img.shields.io/badge/arXiv-2605.04044-b31b1b" alt="arXiv"></a>
 <a href="https://neu-vi.github.io/UniCorrn/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
-<img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Coming%20Soon-yellow?labelColor=grey" alt="Hugging Face Coming Soon">
+<!-- <img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Coming%20Soon-yellow?labelColor=grey" alt="Hugging Face Coming Soon"> -->
 </div>
 
 ___
