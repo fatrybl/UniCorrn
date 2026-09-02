@@ -27,11 +27,14 @@ class GhostAugmentConfig:
         prob: Probability a sample is ghosted.
         rot_std_deg: Std of the screw rotation angle in degrees.
         trans_std: Per-axis translation std in metres.
+
+    Defaults mirror ``vape/models/vape/distortion.py`` — the single place the level is
+    set; the training profile passes all three explicitly.
     """
 
     prob: float = 0.5
-    rot_std_deg: float = 35.0
-    trans_std: float = 1.5
+    rot_std_deg: float = 30.0
+    trans_std: float = 1.2
 
     @classmethod
     def from_mapping(cls, params: Mapping[str, float]) -> Self:
