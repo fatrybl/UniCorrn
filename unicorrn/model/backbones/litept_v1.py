@@ -117,14 +117,11 @@ except Exception as e:
             ), "number of dimensions should be a multiple of three"
             D = tokens.size(3) // 3
             assert positions.ndim == 3 and positions.shape[-1] == 3  # Batch, Seq, 3
-            if max_seqlen == None:
-                cos, sin = self.get_cos_sin(
-                    D, int(positions.max()) + 1, tokens.device, tokens.dtype
-                )
-            else:  # use dynamic sequence length according to batched input
-                cos, sin = self.get_cos_sin(
-                    D, max_seqlen + 1, tokens.device, tokens.dtype
-                )
+            seq_len = int(positions.max()) + 1 if max_seqlen is None else max_seqlen + 1
+            # One table per power-of-two length, so the cache stays bounded whatever the
+            # clouds' extents; a longer table changes no rotation, rows are read by index.
+            seq_len = 1 << (seq_len - 1).bit_length()
+            cos, sin = self.get_cos_sin(D, seq_len, tokens.device, tokens.dtype)
             # split features into three parts along the feature dimension, and apply rope1d on each subspace
             x, y, z = tokens.chunk(3, dim=-1)
             x = self.apply_rope1d(x, positions[:, :, 0], cos, sin)
