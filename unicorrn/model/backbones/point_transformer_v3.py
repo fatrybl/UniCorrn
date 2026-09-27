@@ -2,6 +2,8 @@ import torch.nn as nn
 
 from ...utils.config import configurable, optional_float
 from ..blocks import PointTransformerV3
+from ..blocks.attention_kernels import ATTN_KERNEL_KEY
+from ..blocks.head_widening import MIN_HEAD_DIM_KEY
 from .build import ENCODER_REGISTRY
 
 
@@ -48,6 +50,8 @@ class PTv3_Encoder(PointTransformerV3):
         project_dim=None,
         replace_bn_norm=False,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+        attn_kernel: str | None = None,
+        min_head_dim: int | None = None,
     ):
         super(PTv3_Encoder, self).__init__(
             in_channels=in_channels,
@@ -77,6 +81,8 @@ class PTv3_Encoder(PointTransformerV3):
             pdnorm_affine=pdnorm_affine,
             pdnorm_conditions=pdnorm_conditions,
             replace_bn_norm=replace_bn_norm,
+            attn_kernel=attn_kernel,
+            min_head_dim=min_head_dim,
         )
 
         self.input_project = nn.Identity()
@@ -113,6 +119,8 @@ class PTv3_Encoder(PointTransformerV3):
             "enable_flash": cfg.ENABLE_FLASH,
             "project_dim": cfg.PROJECT_DIM,
             "replace_bn_norm": cfg.REPLACE_BN_NORM,
+            "attn_kernel": cfg.get(ATTN_KERNEL_KEY, None),
+            "min_head_dim": cfg.get(MIN_HEAD_DIM_KEY, None),
         }
 
     def forward(self, pcd, **kwargs):

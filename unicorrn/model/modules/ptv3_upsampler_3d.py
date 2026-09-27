@@ -5,6 +5,8 @@ from functools import partial
 
 from .build import DECODER_REGISTRY
 from ..blocks.point_transformer_v3 import PointSequential, SerializedUnpooling, Block
+from ..blocks.attention_kernels import ATTN_KERNEL_KEY
+from ..blocks.head_widening import MIN_HEAD_DIM_KEY
 from ...utils.config import configurable, optional_float
 
 
@@ -31,6 +33,8 @@ class PTv3Upsampler3D(nn.Module):
                  enable_flash=False,
                  upcast_attention=False,
                  upcast_softmax=False,
+                 attn_kernel: str | None = None,
+                 min_head_dim: int | None = None,
                  **kwargs):
         super().__init__()
         act_layer = nn.GELU
@@ -79,6 +83,8 @@ class PTv3Upsampler3D(nn.Module):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        attn_kernel=attn_kernel,
+                        min_head_dim=min_head_dim,
                     ),
                     name=f"block{i}",
                 )
@@ -101,7 +107,9 @@ class PTv3Upsampler3D(nn.Module):
             'proj_drop': cfg.PROJ_DROP,
             'drop_path': cfg.DROP_PATH,
             'pre_norm': cfg.PRE_NORM,
-            'enable_rpe': cfg.ENABLE_RPE
+            'enable_rpe': cfg.ENABLE_RPE,
+            'attn_kernel': cfg.get(ATTN_KERNEL_KEY, None),
+            'min_head_dim': cfg.get(MIN_HEAD_DIM_KEY, None),
         }
 
     def forward(self, feat, point, *args, **kwargs):

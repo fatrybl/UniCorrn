@@ -9,6 +9,8 @@ from ..grad_ckpt import grad_checkpointing_enabled
 from ...utils import cartesian_img_coord
 from ...utils.config import configurable
 from ..blocks import MMDecoderBlockBidirectional
+from ..blocks.attention_kernels import ATTN_KERNEL_KEY, XFORMERS
+from ..blocks.head_widening import MIN_HEAD_DIM_KEY
 from ..blocks.utils import freeze_modules
 from .build import DECODER_REGISTRY, build_decoder
 
@@ -53,6 +55,8 @@ class UnifiedFeatureEncoder(nn.Module):
         proj_drop=0.0,
         drop_path=0.0,
         pcd_patch_size=1024,
+        attn_kernel: str = XFORMERS,
+        min_head_dim: int | None = None,
         **kwargs
     ):
         super().__init__()
@@ -85,6 +89,8 @@ class UnifiedFeatureEncoder(nn.Module):
                     norm_mem=norm_mem,
                     order_index=self.order_indices[i],
                     pcd_patch_size=pcd_patch_size,
+                    attn_kernel=attn_kernel,
+                    min_head_dim=min_head_dim,
                 )
                 for i in range(dec_depth)
             ]
@@ -125,6 +131,8 @@ class UnifiedFeatureEncoder(nn.Module):
             "proj_drop": cfg.PROJ_DROP,
             "drop_path": cfg.DROP_PATH,
             "pcd_patch_size": cfg.POINT_CLOUD_PATCH_SIZE,
+            "attn_kernel": cfg.get(ATTN_KERNEL_KEY, XFORMERS),
+            "min_head_dim": cfg.get(MIN_HEAD_DIM_KEY, None),
         }
 
     def forward_img_to_img(self, src_feat, tgt_feat, img_H, img_W):

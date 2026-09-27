@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
+from torch import Tensor
 
 from ..embedder import RoPE2D_Continuous, RoPE3D
 from .blocks import DropPath, Mlp
-from .kernel_attention import gaussian_flash_attn
+from . import fa4
+from .kernel_attention import gaussian_fa4_attn, gaussian_flash_attn
 from .utils import freeze_modules, offset2batch
 
 
@@ -34,6 +36,27 @@ class DualStreamCrossAttentionFA(nn.Module):
 
         self.projv = nn.Linear(dim, dim, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
+
+    def attend(self, q: Tensor, k: Tensor, values: list[Tensor]) -> list[Tensor]:
+        """Gaussian attention of every value stream, heads merged into the channels.
+
+        Args:
+            q: Queries ``(B, Nq, H, C)``.
+            k: Keys ``(B, Nk, H, C)``.
+            values: Streams ``(B, Nk, H, Ci)`` sharing the attention matrix.
+
+        Returns:
+            One ``(B, Nq, H * Ci)`` tensor per stream.
+        """
+        return [
+            _merge_heads(
+                gaussian_flash_attn(q, k, v, dropout_p=self.attn_drop),
+                q.shape[0],
+                q.shape[1],
+                v.shape[2] * v.shape[3],
+            )
+            for v in values
+        ]
 
     def forward_query_to_img(
         self,
@@ -78,22 +101,18 @@ class DualStreamCrossAttentionFA(nn.Module):
         k = k.permute(0, 2, 1, 3)
         v = self.projv(value).reshape(B, Nv, H, C // H)
         # Attention Stream 1 : appearance features
-        x = _merge_heads(gaussian_flash_attn(q, k, v, dropout_p=self.attn_drop), B, Nq, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
         # Attention Stream 2 : position features
-        res_out = _merge_heads(
-            gaussian_flash_attn(q, k, res, dropout_p=self.attn_drop), B, Nq, Cres
-        )
-        res_out = self.proj_res(res_out)
-        res_out = self.proj_drop(res_out)
         # (Optional) Attention Stream 3 : GM raw coordinates
+        values = [v, res]
         if gm_res is not None:
-            gm_res = gm_res.reshape(B, Nv, H, 4 // H)
-            gm_out = _merge_heads(
-                gaussian_flash_attn(q, k, gm_res, dropout_p=self.attn_drop), B, Nq, 4
-            )
-            return x, res_out, gm_out
+            values.append(gm_res.reshape(B, Nv, H, 4 // H))
+        attn_out = self.attend(q, k, values)
+        x = self.proj(attn_out[0])
+        x = self.proj_drop(x)
+        res_out = self.proj_res(attn_out[1])
+        res_out = self.proj_drop(res_out)
+        if gm_res is not None:
+            return x, res_out, attn_out[2]
         return x, res_out
 
     def forward_query_to_pcd(
@@ -143,24 +162,16 @@ class DualStreamCrossAttentionFA(nn.Module):
             k = k.permute(0, 2, 1, 3)
 
             v = self.projv(v).reshape(1, -1, self.num_heads, C // self.num_heads)
-            tgt_.append(
-                _merge_heads(gaussian_flash_attn(q, k, v, dropout_p=self.attn_drop), 1, -1, C)
-            )
-            res_.append(
-                _merge_heads(
-                    gaussian_flash_attn(q, k, res, dropout_p=self.attn_drop), 1, -1, Cres
-                )
-            )
-
+            values = [v, res]
             if gm_res_batch is not None:
-                gm_res = gm_res_batch[idx].reshape(
-                    1, -1, self.num_heads, 4 // self.num_heads
+                values.append(
+                    gm_res_batch[idx].reshape(1, -1, self.num_heads, 4 // self.num_heads)
                 )
-                gm_res_.append(
-                    _merge_heads(
-                        gaussian_flash_attn(q, k, gm_res, dropout_p=self.attn_drop), 1, -1, 4
-                    )
-                )
+            attn_out = self.attend(q, k, values)
+            tgt_.append(attn_out[0])
+            res_.append(attn_out[1])
+            if gm_res_batch is not None:
+                gm_res_.append(attn_out[2])
 
         tgt = torch.cat(tgt_, dim=0)
         tgt = self.proj(tgt)
@@ -176,7 +187,31 @@ class DualStreamCrossAttentionFA(nn.Module):
         return tgt, res
 
 
+class DualStreamCrossAttentionFA4(DualStreamCrossAttentionFA):
+    """``DualStreamCrossAttentionFA`` through FlashAttention-4, the value streams merged
+    into as few calls as fit; same parameters, same attention."""
+
+    def __init__(
+        self,
+        dim: int,
+        res_dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
+        """Build the parent after checking the kernel can run; ``attn_drop`` must be 0."""
+        fa4.configure(type(self).__name__, attn_drop)
+        super().__init__(dim, res_dim, num_heads, qkv_bias, attn_drop, proj_drop)
+
+    def attend(self, q: Tensor, k: Tensor, values: list[Tensor]) -> list[Tensor]:
+        """All streams through FlashAttention-4 at once; see :func:`gaussian_fa4_attn`."""
+        return gaussian_fa4_attn(q, k, values)
+
+
 class DualStreamQueryDecoderBlockFA(nn.Module):
+    attention_cls: type[DualStreamCrossAttentionFA] = DualStreamCrossAttentionFA
+
     def __init__(
         self,
         dim,
@@ -197,7 +232,7 @@ class DualStreamQueryDecoderBlockFA(nn.Module):
     ):
         super().__init__()
         res_dim = dim if res_dim is None else res_dim
-        self.cross_attn = DualStreamCrossAttentionFA(
+        self.cross_attn = self.attention_cls(
             dim,
             res_dim,
             num_heads=num_heads,
@@ -351,3 +386,9 @@ class DualStreamQueryDecoderBlockFA(nn.Module):
         if gm_res is not None:
             return tgt, hidden_state, gm_tgt
         return tgt, hidden_state
+
+
+class DualStreamQueryDecoderBlockFA4(DualStreamQueryDecoderBlockFA):
+    """The flash-attention decoder block with FlashAttention-4 cross attention."""
+
+    attention_cls = DualStreamCrossAttentionFA4
