@@ -39,6 +39,12 @@ from .head_widening import PACKED_QKV, head_width, rotate_first
 
 from .serialization import encode
 
+# Tokens one attention call of the patch layout holds in a forward that keeps no graph
+# (SerializedAttentionRoPE): 64 patches of 1024. Measured on clouds of up to 460k tokens,
+# a smaller call lowers neither the forward's peak nor its time and a larger one raises
+# the peak by what it holds; the values do not depend on it.
+PATCH_ATTENTION_TOKENS = 131072	
+
 
 @torch.inference_mode()
 def offset2bincount(offset):
@@ -578,7 +584,6 @@ class SerializedAttentionRoPE(SerializedAttention):
             )
 
         H = self.num_heads
-        K = self.patch_size
         D = self.head_dim
 
         pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
@@ -586,43 +591,24 @@ class SerializedAttentionRoPE(SerializedAttention):
         order = point.serialized_order[self.order_index][pad]
         inverse = unpad[point.serialized_inverse[self.order_index]]
 
+        if not self.enable_flash:
+            feat = self.attend_patches(point, order)[inverse]
+            point.feat = self.proj_drop(self.proj(feat))
+            return point
+
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
 
-        # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
-        if not self.enable_flash:
-            q, k, v = (
-                qkv.reshape(-1, K, 3, H, D).permute(2, 0, 3, 1, 4).unbind(dim=0)
-            )
-        else:
-            q, k, v = qkv.reshape(-1, 3, H, D).permute(1, 2, 0, 3).chunk(3, dim=0)
-
         # the flash branch keeps qkv flat as (1, H, N, C'), so the rotary
-        # positions must stay flat too instead of being split into patches
-        if not self.enable_flash:
-            pos = self.get_pos(point, order).reshape(-1, K, 3)
-        else:
-            pos = self.get_pos(point, order).reshape(1, -1, 3)
+        # positions stay flat too instead of being split into patches
+        q, k, v = qkv.reshape(-1, 3, H, D).permute(1, 2, 0, 3).chunk(3, dim=0)
+        pos = self.get_pos(point, order).reshape(1, -1, 3)
 
-        # print('rope', q.shape, k.shape, v.shape)
         # apply Rotary Position Embedding to the native part of every head
         q = rotate_first(self.rope3d, q, pos.long(), self.native_head_dim)
         k = rotate_first(self.rope3d, k, pos.long(), self.native_head_dim)
 
-        if not self.enable_flash:
-            # attn
-            # (batch_size, seqlen, nheads, headdim)
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
-            if self.attn_kernel == FA4:
-                feat = fa4.half_attention(q, k, v, self.scale)
-            else:
-                feat = memory_efficient_attention(
-                    q.to(v.dtype), k.to(v.dtype), v, scale=self.scale
-                )
-            feat = feat.reshape(-1, H * D)
-        elif self.attn_kernel == FA4:
+        if self.attn_kernel == FA4:
             # (1, nheads, total, headdim) -> (total, nheads, headdim), fp16 like flash-attn
             q, k, v = (t[0].transpose(0, 1).half() for t in (q, k, v))
             feat = fa4.varlen_attention(q, k, v, cu_seqlens, self.patch_size, self.scale)
@@ -648,6 +634,52 @@ class SerializedAttentionRoPE(SerializedAttention):
         feat = self.proj_drop(feat)
         point.feat = feat
         return point
+
+    def attend_patches(self, point, order):
+        """Attention inside every patch of ``patch_size`` serialized tokens, in their
+        serialized order: ``(P * K, H * D)``.
+
+        A forward that keeps its graph makes one call over every patch. A patch attends
+        to itself only, so a forward that keeps none sends the patches through the
+        kernel ``PATCH_ATTENTION_TOKENS`` tokens at a time: the widened ``q``, ``k`` and
+        ``v`` then exist for that many tokens and not for the cloud.
+        """
+        pos = self.get_pos(point, order)
+        if torch.is_grad_enabled():
+            return self.attend(self.qkv(point.feat)[order], pos)
+        step = self.patch_size * max(1, PATCH_ATTENTION_TOKENS // self.patch_size)
+        attended = []
+        for start in range(0, order.shape[0], step):
+            qkv = self.qkv(point.feat[order[start: start + step]])
+            attended.append(self.attend(qkv, pos[start: start + step]))
+        return torch.cat(attended)
+
+    def attend(self, qkv, pos):
+        """Rotary attention of packed patches: ``(P * K, 3 * H * D)`` tokens at their
+        ``(P * K, 3)`` positions in, ``(P * K, H * D)`` out."""
+        H = self.num_heads
+        K = self.patch_size
+        D = self.head_dim
+
+        # (P, K, 3, H, D) => three of (P, H, K, D)
+        q, k, v = qkv.reshape(-1, K, 3, H, D).permute(2, 0, 3, 1, 4).unbind(dim=0)
+        pos = pos.reshape(-1, K, 3).long()
+
+        # apply Rotary Position Embedding to the native part of every head
+        q = rotate_first(self.rope3d, q, pos, self.native_head_dim)
+        k = rotate_first(self.rope3d, k, pos, self.native_head_dim)
+
+        # (batch_size, seqlen, nheads, headdim)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+        if self.attn_kernel == FA4:
+            feat = fa4.half_attention(q, k, v, self.scale)
+        else:
+            feat = memory_efficient_attention(
+                q.to(v.dtype), k.to(v.dtype), v, scale=self.scale
+            )
+        return feat.reshape(-1, H * D)
 
 
 class MLP(nn.Module):
