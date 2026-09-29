@@ -40,10 +40,9 @@ from .head_widening import PACKED_QKV, head_width, rotate_first
 from .serialization import encode
 
 # Tokens one attention call of the patch layout holds in a forward that keeps no graph
-# (SerializedAttentionRoPE): 64 patches of 1024. Measured on clouds of up to 460k tokens,
-# a smaller call lowers neither the forward's peak nor its time and a larger one raises
-# the peak by what it holds; the values do not depend on it.
-PATCH_ATTENTION_TOKENS = 131072	
+# (SerializedAttentionRoPE). The values do not depend on it; a call holds about 44 KiB a
+# token and is no faster for being larger.
+PATCH_ATTENTION_TOKENS = 131072
 
 
 @torch.inference_mode()
