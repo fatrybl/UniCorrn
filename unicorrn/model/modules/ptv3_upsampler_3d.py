@@ -1,3 +1,5 @@
+import copy
+
 import torch
 import torch.nn as nn
 
@@ -105,6 +107,8 @@ class PTv3Upsampler3D(nn.Module):
         }
 
     def forward(self, feat, point, *args, **kwargs):
+        # A copy: checkpointed fusion blocks still hold the encoder's Point.
+        point = copy.copy(point)
         point.feat = feat
         point_f = self.dec(point)
 

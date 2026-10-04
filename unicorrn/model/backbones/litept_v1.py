@@ -598,7 +598,8 @@ class GridUnpooling(PointModule):
     def forward(self, point):
         assert "pooling_parent" in point.keys()
         assert "pooling_inverse" in point.keys()
-        parent = point.pop("pooling_parent")
+        # A copy: checkpointed encoder blocks still hold the parent.
+        parent = copy.copy(point.pop("pooling_parent"))
         inverse = point.pooling_inverse
         feat = point.feat
 

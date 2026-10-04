@@ -885,7 +885,8 @@ class SerializedUnpooling(PointModule):
     def forward(self, point):
         assert "pooling_parent" in point.keys()
         assert "pooling_inverse" in point.keys()
-        parent = point.pop("pooling_parent")
+        # A copy: checkpointed encoder blocks still hold the parent.
+        parent = copy.copy(point.pop("pooling_parent"))
         inverse = point.pop("pooling_inverse")
         point = self.proj(point)
         parent = self.proj_skip(parent)
@@ -920,7 +921,8 @@ class SerializedCatUnpooling(PointModule):
     def forward(self, point):
         assert "pooling_parent" in point.keys()
         assert "pooling_inverse" in point.keys()
-        parent = point.pop("pooling_parent")
+        # A copy: checkpointed encoder blocks still hold the parent.
+        parent = copy.copy(point.pop("pooling_parent"))
         inverse = point.pop("pooling_inverse")
         parent.feat = torch.concat([parent.feat, point.feat[inverse]], dim=-1)
         parent = self.cat_proj(parent)
