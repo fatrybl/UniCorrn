@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend
+from torch import Tensor
 from xformers.ops import memory_efficient_attention
+
+from . import fa4
 
 
 @nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION)
@@ -85,6 +88,36 @@ def gaussian_flash_attn(q, k, v, **kwargs):
     return attn_out[..., :-v_padding] if v_padding else attn_out
 
 
+def gaussian_fa4_attn(q: Tensor, k: Tensor, values: list[Tensor]) -> list[Tensor]:
+    """The Gaussian attention of ``gaussian_flash_attn`` for every value stream at once.
+
+    The streams share one attention matrix, and attention is linear in the values, so
+    they are concatenated along the head width, attended together and split again --
+    exact, and one FlashAttention-4 call per group instead of one per stream. Groups are
+    packed up to the augmented query width, so each call keeps equal query and value
+    widths, the shape the current kernel runs at. Inputs are fp32 and are cast to bf16 for
+    the kernel like ``flash_attention``; the augmentation happens before the cast.
+
+    Args:
+        q: Queries ``(B, N, H, C)``.
+        k: Keys ``(B, M, H, C)``.
+        values: Streams ``(B, M, H, Ci)`` of any widths.
+
+    Returns:
+        One ``(B, N, H * Ci)`` fp32 tensor per stream, in the order given.
+    """
+    q_prime, k_prime = gaussian_augment(q, k)
+    q_prime, k_prime = q_prime.bfloat16(), k_prime.bfloat16()
+    widths = [v.shape[-1] for v in values]
+    outputs: list[Tensor] = []
+    for group in _pack_streams(widths, q_prime.shape[-1]):
+        packed = torch.cat([values[i].bfloat16() for i in group], dim=-1)
+        out = fa4.attention(q_prime, k_prime, packed, softmax_scale=1 / q.shape[-1])
+        parts = out.float().split([widths[i] for i in group], dim=-1)
+        outputs.extend(part.reshape(*part.shape[:2], -1) for part in parts)
+    return outputs
+
+
 def _split_and_concat_multi_head(tensors, H):
     multi_head_out = []
     dim_per_head = []
@@ -122,3 +155,25 @@ def get_superpoint_mapping(points, mapping=None):
             points["pooling_parent"], mapping[points["pooling_inverse"]]
         )
     return mapping
+
+
+def _pack_streams(widths: list[int], limit: int) -> list[list[int]]:
+    """Consecutive groups of stream indices whose widths sum to at most ``limit``.
+
+    A stream wider than ``limit`` forms a group of its own.
+
+    Args:
+        widths: Head width of every stream, in order.
+        limit: Largest total width of one group.
+    """
+    groups: list[list[int]] = []
+    current: list[int] = []
+    used = 0
+    for index, width in enumerate(widths):
+        if current and used + width > limit:
+            groups.append(current)
+            current, used = [], 0
+        current.append(index)
+        used += width
+    groups.append(current)
+    return groups

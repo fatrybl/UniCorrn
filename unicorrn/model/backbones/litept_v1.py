@@ -11,6 +11,7 @@ from addict import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 import spconv.pytorch as spconv
 import torch_scatter
 from timm.layers import DropPath
@@ -22,6 +23,9 @@ except ImportError:
     flash_attn = None
 
 from ...utils.config import configurable, optional_float
+from ..blocks import fa4
+from ..blocks.attention_kernels import ATTN_KERNEL_KEY, FA4, FLASH, check_kernel
+from ..blocks.head_widening import MIN_HEAD_DIM_KEY, PACKED_QKV, head_width, rotate_first
 from ..blocks.point_transformer_v3 import (
     Point,
     PointModule,
@@ -50,6 +54,9 @@ try:
         @staticmethod
         def backward(ctx, grad_res):
             positions, base, F0 = ctx.saved_tensors[0], ctx.saved_base, ctx.saved_F0
+            # The kernel rotates in place and needs a contiguous tensor; the gradient of a
+            # rotated slice of a wider head arrives strided.
+            grad_res = grad_res.contiguous()
             _kernels.pointrope(grad_res, positions, base, -F0)
             ctx.mark_dirty(grad_res)
             return grad_res, None, None, None
@@ -132,6 +139,8 @@ except Exception as e:
 
 
 class PointROPEAttention(PointModule):
+    head_projections = PACKED_QKV
+
     def __init__(
         self,
         channels,
@@ -143,19 +152,26 @@ class PointROPEAttention(PointModule):
         attn_drop=0.0,
         proj_drop=0.0,
         order_index=0,
+        attn_kernel: str = FLASH,
+        min_head_dim: int | None = None,
     ):
         super().__init__()
         assert channels % num_heads == 0
+        check_kernel(attn_kernel, (FLASH, FA4), type(self).__name__, attn_drop)
+        self.attn_kernel = attn_kernel
         self.channels = channels
         self.num_heads = num_heads
-        self.scale = qk_scale or (channels // num_heads) ** -0.5
+        self.native_head_dim = channels // num_heads
+        self.head_dim = head_width(channels, num_heads, min_head_dim)
+        self.scale = qk_scale or self.native_head_dim ** -0.5
         self.order_index = order_index
 
         self.patch_size = patch_size
         self.attn_drop = attn_drop
 
-        self.qkv = torch.nn.Linear(channels, channels * 3, bias=qkv_bias)
-        self.proj = torch.nn.Linear(channels, channels)
+        inner = num_heads * self.head_dim
+        self.qkv = torch.nn.Linear(channels, inner * 3, bias=qkv_bias)
+        self.proj = torch.nn.Linear(inner, channels)
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.softmax = torch.nn.Softmax(dim=-1)
 
@@ -224,7 +240,7 @@ class PointROPEAttention(PointModule):
 
         H = self.num_heads
         K = self.patch_size
-        C = self.channels
+        D = self.head_dim
 
         pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
 
@@ -239,41 +255,23 @@ class PointROPEAttention(PointModule):
         pos = pos.reshape(-1, 3).unsqueeze(0)
 
         q, k, v = qkv.half().chunk(3, dim=-1)
-        q = q.reshape(-1, H, C // H).transpose(0, 1)[None]  # [1, H, N, head_dim]
-        k = k.reshape(-1, H, C // H).transpose(0, 1)[None]  # [1, H, N, head_dim]
+        q = q.reshape(-1, H, D).transpose(0, 1)[None]  # [1, H, N, head_dim]
+        k = k.reshape(-1, H, D).transpose(0, 1)[None]  # [1, H, N, head_dim]
 
-        # workround to make pointrope cuda float32 happy
-        q = self.rope(q.float(), pos).to(q.dtype)  # [1, H, N, head_dim]
-        k = self.rope(k.float(), pos).to(k.dtype)  # [1, H, N, head_dim]
+        q = self._rotate(q, pos)  # [1, H, N, head_dim]
+        k = self._rotate(k, pos)  # [1, H, N, head_dim]
 
-        # assemble input for flash attention
-        qkv_rotated = torch.stack(
-            [
-                q.squeeze(0).transpose(0, 1),
-                k.squeeze(0).transpose(0, 1),
-                v.reshape(-1, H, C // H),
-            ],
-            dim=1,
-        )  # [N, 3, H, head_dim]
-
-        if flash_attn is None:
-            raise ImportError(
-                "LitePT forward requires flash_attn, but it is not installed. "
-                "Please install flash_attn to run LitePT attention."
-            )
-
-        # spconv's sparse CPE has no half-precision kernel in this build, so the
-        # module runs in fp32 and only the attention input is cast, matching how
-        # PTv3 feeds flash-attn in this repo.
-        feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-            qkv_rotated.half(),
-            cu_seqlens,
-            max_seqlen=self.patch_size,
-            dropout_p=self.attn_drop if self.training else 0,
-            softmax_scale=self.scale,
-        ).reshape(-1, C)
-
-        feat = feat.to(qkv.dtype)
+        # [N, H, head_dim] each. spconv's sparse CPE has no half-precision kernel in
+        # this build, so the module runs in fp32 and only the attention input is cast,
+        # matching how PTv3 feeds flash-attn in this repo.
+        q = q.squeeze(0).transpose(0, 1)
+        k = k.squeeze(0).transpose(0, 1)
+        v = v.reshape(-1, H, D)
+        if self.attn_kernel == FA4:
+            feat = fa4.varlen_attention(q, k, v, cu_seqlens, self.patch_size, self.scale)
+        else:
+            feat = self._flash_attention(q, k, v, cu_seqlens)
+        feat = feat.reshape(-1, H * D).to(qkv.dtype)
         feat = feat[inverse]
 
         # ffn
@@ -281,6 +279,38 @@ class PointROPEAttention(PointModule):
         feat = self.proj_drop(feat)
         point.feat = feat
         return point
+
+    def _rotate(self, tokens: Tensor, positions: Tensor) -> Tensor:
+        """PointROPE over the native part of every head, in fp32 as the kernel wants.
+
+        Args:
+            tokens: ``[1, H, N, head_dim]`` queries or keys.
+            positions: ``[1, N, 3]`` grid coordinates.
+        """
+        rotated = rotate_first(self.rope, tokens.float(), positions, self.native_head_dim)
+        return rotated.to(tokens.dtype)
+
+    def _flash_attention(self, q: Tensor, k: Tensor, v: Tensor, cu_seqlens: Tensor) -> Tensor:
+        """flash-attn v2 over the patches, from the packed ``[N, 3, H, head_dim]`` input.
+
+        Args:
+            q: Rotated queries ``[N, H, head_dim]``, fp16.
+            k: Rotated keys, same layout.
+            v: Values, same layout.
+            cu_seqlens: Int32 patch boundaries.
+        """
+        if flash_attn is None:
+            raise ImportError(
+                "LitePT forward requires flash_attn, but it is not installed. "
+                "Please install flash_attn to run LitePT attention."
+            )
+        return flash_attn.flash_attn_varlen_qkvpacked_func(
+            torch.stack([q, k, v], dim=1).half(),
+            cu_seqlens,
+            max_seqlen=self.patch_size,
+            dropout_p=self.attn_drop if self.training else 0,
+            softmax_scale=self.scale,
+        )
 
 
 class MLP(nn.Module):
@@ -329,6 +359,8 @@ class Block(PointModule):
         enable_conv=True,
         enable_attn=True,
         rope_freq=100.0,
+        attn_kernel: str = FLASH,
+        min_head_dim: int | None = None,
     ):
         super().__init__()
         self.channels = channels
@@ -366,6 +398,8 @@ class Block(PointModule):
                 attn_drop=attn_drop,
                 proj_drop=proj_drop,
                 order_index=order_index,
+                attn_kernel=attn_kernel,
+                min_head_dim=min_head_dim,
             )
             self.norm2 = PointSequential(norm_layer(channels))
             self.mlp = PointSequential(
@@ -675,6 +709,8 @@ class LitePT(PointModule):
         pre_norm=True,
         shuffle_orders=True,
         enc_mode=False,
+        attn_kernel: str = FLASH,
+        min_head_dim: int | None = None,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -754,6 +790,8 @@ class LitePT(PointModule):
                         enable_conv=enc_conv[s],
                         enable_attn=enc_attn[s],
                         rope_freq=enc_rope_freq[s],
+                        attn_kernel=attn_kernel,
+                        min_head_dim=min_head_dim,
                     ),
                     name=f"block{i}",
                 )
@@ -803,6 +841,8 @@ class LitePT(PointModule):
                             enable_conv=dec_conv[s],
                             enable_attn=dec_attn[s],
                             rope_freq=dec_rope_freq[s],
+                            attn_kernel=attn_kernel,
+                            min_head_dim=min_head_dim,
                         ),
                         name=f"block{i}",
                     )
@@ -875,6 +915,8 @@ class LitePT_Encoder(LitePT):
         shuffle_orders=True,
         enc_mode=True,
         project_dim=False,
+        attn_kernel: str = FLASH,
+        min_head_dim: int | None = None,
     ):
         num_stages = len(enc_depths)
         enc_conv = (True,) * num_stages if enc_conv is None else enc_conv
@@ -901,6 +943,8 @@ class LitePT_Encoder(LitePT):
             pre_norm=pre_norm,
             shuffle_orders=shuffle_orders,
             enc_mode=enc_mode,
+            attn_kernel=attn_kernel,
+            min_head_dim=min_head_dim,
         )
 
         self.input_project = nn.Identity()
@@ -936,6 +980,8 @@ class LitePT_Encoder(LitePT):
             "shuffle_orders": cfg.SHUFFLE_ORDERS,
             "enc_mode": cfg.get("ENC_MODE", True),
             "project_dim": cfg.PROJECT_DIM,
+            "attn_kernel": cfg.get(ATTN_KERNEL_KEY, FLASH),
+            "min_head_dim": cfg.get(MIN_HEAD_DIM_KEY, None),
         }
 
     def forward(self, pcd, **kwargs):

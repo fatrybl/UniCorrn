@@ -1,16 +1,22 @@
 import torch
 import torch.nn as nn
+from torch import Tensor
 from xformers.ops import memory_efficient_attention
 
 from ..embedder import RoPE2D_Continuous, RoPE3D
+from . import fa4
+from .attention_kernels import FA4, XFORMERS, check_kernel
 from .blocks import DropPath, Mlp
+from .head_widening import PACKED_QKV, SEPARATE_QKV, head_width, rotate_first
 from .point_transformer_v3 import offset2bincount
 from .utils import batch2offset, offset2batch
 
 
-def _attention(q, k, v, p):
-    """Memory-efficient attention with q/k cast to the value dtype (autocast-safe)."""
-    return memory_efficient_attention(q.to(v.dtype), k.to(v.dtype), v, p=p)
+def _attention(q: Tensor, k: Tensor, v: Tensor, p: float, kernel: str, scale: float) -> Tensor:
+    """Attention with q/k cast to the value dtype (autocast-safe), through ``kernel``."""
+    if kernel == FA4:
+        return fa4.half_attention(q, k, v, scale)
+    return memory_efficient_attention(q.to(v.dtype), k.to(v.dtype), v, p=p, scale=scale)
 
 
 class MMEfficientAttention(nn.Module):
@@ -18,6 +24,8 @@ class MMEfficientAttention(nn.Module):
     Multi-Modal (MM) Efficient Self Attention block
 
     """
+
+    head_projections = PACKED_QKV
 
     def __init__(
         self,
@@ -28,14 +36,20 @@ class MMEfficientAttention(nn.Module):
         proj_drop=0.0,
         pcd_patch_size=1024,
         order_index=0,
+        attn_kernel: str = XFORMERS,
+        min_head_dim: int | None = None,
     ):
         super().__init__()
+        check_kernel(attn_kernel, (XFORMERS, FA4), type(self).__name__, attn_drop)
+        self.attn_kernel = attn_kernel
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.native_head_dim = dim // num_heads
+        self.head_dim = head_width(dim, num_heads, min_head_dim)
+        self.scale = self.native_head_dim**-0.5
+        inner = num_heads * self.head_dim
+        self.qkv = nn.Linear(dim, inner * 3, bias=qkv_bias)
         self.attn_drop = attn_drop
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(inner, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.patch_size = 0
         self.patch_size_max = pcd_patch_size
@@ -111,24 +125,24 @@ class MMEfficientAttention(nn.Module):
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
     def forward_img_tokens(self, x, xpos):
-        B, N, C = x.shape
+        B, N, _ = x.shape
         qkv = (
             self.qkv(x)
-            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+            .reshape(B, N, 3, self.num_heads, self.head_dim)
             .transpose(1, 3)
         )
-        q, k, v = [qkv[:, :, i] for i in range(3)]  # B x num_heads x N x C // num_heads
+        q, k, v = [qkv[:, :, i] for i in range(3)]  # B x num_heads x N x head_dim
 
-        q = self.rope2d(q, xpos)
-        k = self.rope2d(k, xpos)
+        q = rotate_first(self.rope2d, q, xpos, self.native_head_dim)
+        k = rotate_first(self.rope2d, k, xpos, self.native_head_dim)
 
         # (batch_size, seqlen, nheads, headdim)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        x = _attention(q, k, v, self.attn_drop)
-        x = x.reshape([B, N, C])
+        x = _attention(q, k, v, self.attn_drop, self.attn_kernel, self.scale)
+        x = x.reshape([B, N, self.num_heads * self.head_dim])
 
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -141,7 +155,7 @@ class MMEfficientAttention(nn.Module):
 
         H = self.num_heads
         K = self.patch_size
-        C = x.shape[-1]
+        D = self.head_dim
 
         pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
 
@@ -151,19 +165,19 @@ class MMEfficientAttention(nn.Module):
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(x)[order]
 
-        q, k, v = qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
+        q, k, v = qkv.reshape(-1, K, 3, H, D).permute(2, 0, 3, 1, 4).unbind(dim=0)
 
         pos = self.get_pos(point, order).reshape(-1, K, 3)
 
-        # apply Rotary Position Embedding
-        q = self.rope3d(q, pos)
-        k = self.rope3d(k, pos)
+        # apply Rotary Position Embedding to the native part of every head
+        q = rotate_first(self.rope3d, q, pos, self.native_head_dim)
+        k = rotate_first(self.rope3d, k, pos, self.native_head_dim)
 
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
-        feat = _attention(q, k, v, self.attn_drop)
-        feat = feat.reshape(-1, C)
+        feat = _attention(q, k, v, self.attn_drop, self.attn_kernel, self.scale)
+        feat = feat.reshape(-1, H * D)
 
         feat = feat[inverse]
 
@@ -179,63 +193,66 @@ class MMEfficientCrossAttention(nn.Module):
 
     """
 
-    def __init__(self, dim, num_heads=8, qkv_bias=True, attn_drop=0.0, proj_drop=0.0):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+    head_projections = SEPARATE_QKV
 
-        self.projq = nn.Linear(dim, dim, bias=qkv_bias)
-        self.projk = nn.Linear(dim, dim, bias=qkv_bias)
-        self.projv = nn.Linear(dim, dim, bias=qkv_bias)
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        qkv_bias=True,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        attn_kernel: str = XFORMERS,
+        min_head_dim: int | None = None,
+    ):
+        super().__init__()
+        check_kernel(attn_kernel, (XFORMERS, FA4), type(self).__name__, attn_drop)
+        self.attn_kernel = attn_kernel
+        self.num_heads = num_heads
+        self.native_head_dim = dim // num_heads
+        self.head_dim = head_width(dim, num_heads, min_head_dim)
+        self.scale = self.native_head_dim**-0.5
+        inner = num_heads * self.head_dim
+
+        self.projq = nn.Linear(dim, inner, bias=qkv_bias)
+        self.projk = nn.Linear(dim, inner, bias=qkv_bias)
+        self.projv = nn.Linear(dim, inner, bias=qkv_bias)
         self.attn_drop = attn_drop
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(inner, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.rope2d = RoPE2D_Continuous()
         self.rope3d = RoPE3D()
 
     def forward_img_to_img(self, query, key, value, qpos, kpos):
-        B, Nq, C = query.shape
+        B, Nq, _ = query.shape
         Nk = key.shape[1]
         Nv = value.shape[1]
 
-        q = (
-            self.projq(query)
-            .reshape(B, Nq, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
-        k = (
-            self.projk(key)
-            .reshape(B, Nk, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
-        v = self.projv(value).reshape(B, Nv, self.num_heads, C // self.num_heads)
+        q = self.projq(query).reshape(B, Nq, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.projk(key).reshape(B, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.projv(value).reshape(B, Nv, self.num_heads, self.head_dim)
 
-        q = self.rope2d(q, qpos)
-        k = self.rope2d(k, kpos)
+        q = rotate_first(self.rope2d, q, qpos, self.native_head_dim)
+        k = rotate_first(self.rope2d, k, kpos, self.native_head_dim)
 
         # (batch_size, seqlen, nheads, headdim)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
 
-        x = _attention(q, k, v, self.attn_drop)
-        x = x.reshape([B, Nq, C])
+        x = _attention(q, k, v, self.attn_drop, self.attn_kernel, self.scale)
+        x = x.reshape([B, Nq, self.num_heads * self.head_dim])
 
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
     def forward_img_to_pcd(self, query, key, value, qpos, kpos, tgt_point_offset):
-        B, Nq, C = query.shape
+        B, Nq, _ = query.shape
 
         # image
-        q = (
-            self.projq(query)
-            .reshape(B, Nq, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
-        q = self.rope2d(q, qpos)
+        q = self.projq(query).reshape(B, Nq, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q = rotate_first(self.rope2d, q, qpos, self.native_head_dim)
 
         key_batch, kpos_batch = offset2batch(key, kpos, tgt_point_offset)
         val_batch, _ = offset2batch(value, kpos, tgt_point_offset)
@@ -248,49 +265,33 @@ class MMEfficientCrossAttention(nn.Module):
             Nv = val_batch[i].shape[0]  # number of points x dim
 
             # point
-            k_i = (
-                self.projk(k_i)
-                .reshape(1, Nk, self.num_heads, C // self.num_heads)
-                .permute(0, 2, 1, 3)
-            )
-            v_i = (
-                self.projv(v_i)
-                .reshape(1, Nv, self.num_heads, C // self.num_heads)
-                .permute(0, 2, 1, 3)
-            )
+            k_i = self.projk(k_i).reshape(1, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            v_i = self.projv(v_i).reshape(1, Nv, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-            k_i = self.rope3d(k_i, kpos_batch[i][None])
+            k_i = rotate_first(self.rope3d, k_i, kpos_batch[i][None], self.native_head_dim)
 
             # (batch_size, seqlen, nheads, headdim)
             q_i = q_i.permute(0, 2, 1, 3)
             k_i = k_i.permute(0, 2, 1, 3)
             v_i = v_i.permute(0, 2, 1, 3)
 
-            x.append(_attention(q_i, k_i, v_i, self.attn_drop))
+            x.append(_attention(q_i, k_i, v_i, self.attn_drop, self.attn_kernel, self.scale))
 
         x = torch.vstack(x)
-        x = x.reshape([B, Nq, C])
+        x = x.reshape([B, Nq, self.num_heads * self.head_dim])
 
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
     def forward_pcd_to_img(self, query, key, value, qpos, kpos, src_point_offset):
-        B, Nk, C = key.shape
+        B, Nk, _ = key.shape
         Nv = value.shape[1]
 
-        k = (
-            self.projk(key)
-            .reshape(B, Nk, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
-        v = (
-            self.projv(value)
-            .reshape(B, Nv, self.num_heads, C // self.num_heads)
-            .permute(0, 2, 1, 3)
-        )
+        k = self.projk(key).reshape(B, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.projv(value).reshape(B, Nv, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        k = self.rope2d(k, kpos)
+        k = rotate_first(self.rope2d, k, kpos, self.native_head_dim)
 
         query_batch, qpos_batch = offset2batch(query, qpos, src_point_offset)
 
@@ -300,21 +301,17 @@ class MMEfficientCrossAttention(nn.Module):
 
             Nq = q_i.shape[0]
 
-            q_i = (
-                self.projq(q_i)
-                .reshape(1, Nq, self.num_heads, C // self.num_heads)
-                .permute(0, 2, 1, 3)
-            )
-            q_i = self.rope3d(q_i, qpos_batch[i][None])
+            q_i = self.projq(q_i).reshape(1, Nq, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            q_i = rotate_first(self.rope3d, q_i, qpos_batch[i][None], self.native_head_dim)
 
             q_i = q_i.permute(0, 2, 1, 3)
             k_i = k_i.permute(0, 2, 1, 3)
             v_i = v_i.permute(0, 2, 1, 3)
 
-            output = _attention(q_i, k_i, v_i, self.attn_drop)
-            x.append(output.reshape(1, Nq, C))
+            output = _attention(q_i, k_i, v_i, self.attn_drop, self.attn_kernel, self.scale)
+            x.append(output.reshape(1, Nq, self.num_heads * self.head_dim))
 
-        x = batch2offset(x)  # (Npoints, C)
+        x = batch2offset(x)  # (Npoints, inner)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -322,7 +319,6 @@ class MMEfficientCrossAttention(nn.Module):
     def forward_pcd_to_pcd(
         self, query, key, value, qpos, kpos, src_point_offset, tgt_point_offset
     ):
-        _, C = query.shape
         assert tgt_point_offset.shape[0] == src_point_offset.shape[0]
         query_batch, qpos_batch = offset2batch(query, qpos, src_point_offset)
         key_batch, kpos_batch = offset2batch(key, kpos, tgt_point_offset)
@@ -336,25 +332,17 @@ class MMEfficientCrossAttention(nn.Module):
             Nk = k_i.shape[0]
             Nv = v_i.shape[0]
 
-            q_i = (
-                self.projq(q_i)
-                .reshape(1, Nq, self.num_heads, C // self.num_heads)
-                .permute(0, 2, 1, 3)
-            )
-            q_i = self.rope3d(q_i, qpos_batch[i][None])
-            k_i = (
-                self.projk(k_i)
-                .reshape(1, Nk, self.num_heads, C // self.num_heads)
-                .permute(0, 2, 1, 3)
-            )
-            k_i = self.rope3d(k_i, kpos_batch[i][None])
-            v_i = self.projv(v_i).reshape(1, Nv, self.num_heads, C // self.num_heads)
+            q_i = self.projq(q_i).reshape(1, Nq, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            q_i = rotate_first(self.rope3d, q_i, qpos_batch[i][None], self.native_head_dim)
+            k_i = self.projk(k_i).reshape(1, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            k_i = rotate_first(self.rope3d, k_i, kpos_batch[i][None], self.native_head_dim)
+            v_i = self.projv(v_i).reshape(1, Nv, self.num_heads, self.head_dim)
 
             q_i = q_i.permute(0, 2, 1, 3)
             k_i = k_i.permute(0, 2, 1, 3)
 
-            output = _attention(q_i, k_i, v_i, self.attn_drop)
-            x.append(output.reshape(1, Nq, C))
+            output = _attention(q_i, k_i, v_i, self.attn_drop, self.attn_kernel, self.scale)
+            x.append(output.reshape(1, Nq, self.num_heads * self.head_dim))
 
         x = batch2offset(x)
         x = self.proj(x)
@@ -381,6 +369,8 @@ class MMDecoderBlock(nn.Module):
         norm_mem=True,
         order_index=0,
         pcd_patch_size=1024,
+        attn_kernel: str = XFORMERS,
+        min_head_dim: int | None = None,
     ):
         super().__init__()
 
@@ -392,6 +382,8 @@ class MMDecoderBlock(nn.Module):
             proj_drop=drop,
             pcd_patch_size=pcd_patch_size,
             order_index=order_index,
+            attn_kernel=attn_kernel,
+            min_head_dim=min_head_dim,
         )
         self.cross_attn = MMEfficientCrossAttention(
             dim,
@@ -399,6 +391,8 @@ class MMDecoderBlock(nn.Module):
             qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=drop,
+            attn_kernel=attn_kernel,
+            min_head_dim=min_head_dim,
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -513,6 +507,8 @@ class MMDecoderBlockBidirectional(nn.Module):
         norm_mem=True,
         order_index=0,
         pcd_patch_size=1024,
+        attn_kernel: str = XFORMERS,
+        min_head_dim: int | None = None,
     ):
         super().__init__()
         self.decoder_block = MMDecoderBlock(
@@ -528,6 +524,8 @@ class MMDecoderBlockBidirectional(nn.Module):
             norm_mem=norm_mem,
             order_index=order_index,
             pcd_patch_size=pcd_patch_size,
+            attn_kernel=attn_kernel,
+            min_head_dim=min_head_dim,
         )
 
     def forward_img_to_img(self, src, tgt, src_pos, tgt_pos):
@@ -549,3 +547,4 @@ class MMDecoderBlockBidirectional(nn.Module):
         src_ = self.decoder_block.forward_pcd_to_pcd(src, tgt, src_point, tgt_point)
         tgt_ = self.decoder_block.forward_pcd_to_pcd(tgt, src, tgt_point, src_point)
         return src_, tgt_
+

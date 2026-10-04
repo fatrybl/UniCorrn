@@ -17,6 +17,8 @@ from functools import partial
 
 from .build import ENCODER_REGISTRY
 from ..blocks import Block
+from ..blocks.attention_kernels import XFORMERS
+from ..blocks.blocks import attention_kernel
 from ...utils.config import configurable
 
 
@@ -38,7 +40,7 @@ class CrocoV2_Encoder(nn.Module):
             attn_drop=0.,
             proj_drop=0.,
             drop_path=0.,
-            use_flash_attn=False,
+            attn_kernel: str = XFORMERS,
             **kwargs
     ):
         super(CrocoV2_Encoder, self).__init__()
@@ -62,7 +64,7 @@ class CrocoV2_Encoder(nn.Module):
                 drop=proj_drop,
                 attn_drop=attn_drop,
                 drop_path=drop_path,
-                use_flash_attn=use_flash_attn
+                attn_kernel=attn_kernel
             ) for i in range(depth)])
 
         self.enc_norm = norm_layer(embed_dim)
@@ -79,7 +81,7 @@ class CrocoV2_Encoder(nn.Module):
             "attn_drop": cfg.ATTN_DROP,
             "proj_drop": cfg.PROJ_DROP,
             "drop_path": cfg.DROP_PATH,
-            "use_flash_attn": cfg.USE_FLASH_ATTN
+            "attn_kernel": attention_kernel(cfg)
         }
 
     def forward(self, x, pos, do_mask=False, return_all_blocks=False, **kwargs):

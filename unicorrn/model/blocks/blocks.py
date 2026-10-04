@@ -17,11 +17,14 @@ import collections.abc
 
 import torch
 import torch.nn as nn
+from torch import Tensor
 
 from itertools import repeat
+from . import fa4
+from .attention_kernels import ATTN_KERNEL_KEY, FA4, FLASH, XFORMERS
 from .build import MODULES_REGISTRY
 from .functional import get_functional
-from ...utils.config import configurable
+from ...utils.config import CfgNode, configurable
 
 from unicorrn.utils.vision3d.ops import index_select, knn
 
@@ -207,8 +210,14 @@ class EfficientAttention(Attention):
 
 @MODULES_REGISTRY.register(name="crocov2_flash_attn_module")
 class FlashAttention(Attention):
+    available: bool = FLASH_AVAILABLE
+
+    def kernel(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Attention over ``(B, N, H, D)`` tensors through flash-attn v2, in fp16."""
+        return flash_attention(q, k, v)
+
     def forward(self, x, xpos):
-        if not FLASH_AVAILABLE:
+        if not self.available:
             return super().forward(x, xpos)
 
         B, N, C = x.shape
@@ -224,7 +233,7 @@ class FlashAttention(Attention):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        x = flash_attention(q, k, v)
+        x = self.kernel(q, k, v)
         x = x.reshape([B, N, C])
 
         x = self.proj(x)
@@ -232,33 +241,74 @@ class FlashAttention(Attention):
         return x
 
 
+@MODULES_REGISTRY.register(name="crocov2_fa4_attn_module")
+class FlashAttention4(FlashAttention):
+    """``FlashAttention`` through the FlashAttention-4 kernel: same fp16 cast, same maths."""
+
+    available: bool = True
+
+    def __init__(
+        self,
+        dim: int,
+        rope: nn.Module | None = None,
+        num_heads: int = 8,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.,
+        proj_drop: float = 0.,
+    ) -> None:
+        """Build the parent after checking the kernel can run; ``attn_drop`` must be 0."""
+        fa4.configure(type(self).__name__, attn_drop)
+        super().__init__(dim, rope=rope, num_heads=num_heads, qkv_bias=qkv_bias,
+                         attn_drop=attn_drop, proj_drop=proj_drop)
+
+    def kernel(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """The FlashAttention-4 counterpart of ``FlashAttention.kernel``."""
+        out = fa4.attention(
+            q.to(torch.float16), k.to(torch.float16), v.to(torch.float16), softmax_scale=self.scale
+        )
+        return out.to(torch.float32)
+
+
+ATTENTION_KERNELS: dict[str, type[Attention]] = {
+    XFORMERS: EfficientAttention,
+    FLASH: FlashAttention,
+    FA4: FlashAttention4,
+}
+
+
+def attention_kernel(cfg: CfgNode) -> str:
+    """The kernel a CroCo config asks for: ``ATTN_KERNEL`` if set, else the legacy flash flag.
+
+    Args:
+        cfg: The encoder's config block.
+    """
+    legacy = FLASH if cfg.USE_FLASH_ATTN else XFORMERS
+    return cfg.get(ATTN_KERNEL_KEY, legacy)
+
+
 @MODULES_REGISTRY.register(name="crocov2_encoder_block")
 class Block(nn.Module):
 
     @configurable
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer="gelu", norm_layer=nn.LayerNorm, rope=None, use_flash_attn=False):
+                 drop_path=0., act_layer="gelu", norm_layer=nn.LayerNorm, rope=None,
+                 attn_kernel: str = XFORMERS):
         super().__init__()
         self.norm1 = norm_layer(dim)
 
-        if use_flash_attn:
-            self.attn = FlashAttention(
-                dim,
-                rope=rope,
-                num_heads=num_heads,
-                qkv_bias=qkv_bias,
-                attn_drop=attn_drop,
-                proj_drop=drop
+        if attn_kernel not in ATTENTION_KERNELS:
+            raise ValueError(
+                f"Unknown attention kernel {attn_kernel!r}; "
+                f"expected one of {sorted(ATTENTION_KERNELS)}"
             )
-        else:
-            self.attn = EfficientAttention(
-                dim,
-                rope=rope,
-                num_heads=num_heads,
-                qkv_bias=qkv_bias,
-                attn_drop=attn_drop,
-                proj_drop=drop
-            )
+        self.attn = ATTENTION_KERNELS[attn_kernel](
+            dim,
+            rope=rope,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop
+        )
 
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -277,7 +327,7 @@ class Block(nn.Module):
             "attn_drop": cfg.ATTN_DROP_OUT,
             "drop": cfg.DROP_OUT,
             "drop_path": cfg.DROP_PATH,
-            "use_flash_attn": cfg.USE_FLASH_ATTN
+            "attn_kernel": attention_kernel(cfg)
         }
 
     def forward(self, x, xpos):

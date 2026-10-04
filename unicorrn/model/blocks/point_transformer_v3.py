@@ -33,7 +33,16 @@ try:
 except ImportError:
     flash_attn = None
 
+from . import fa4
+from .attention_kernels import FA4, check_kernel
+from .head_widening import PACKED_QKV, head_width, rotate_first
+
 from .serialization import encode
+
+# Tokens one attention call of the patch layout holds in a forward that keeps no graph
+# (SerializedAttentionRoPE). The values do not depend on it; a call holds about 44 KiB a
+# token and is no faster for being larger.
+PATCH_ATTENTION_TOKENS = 131072
 
 
 @torch.inference_mode()
@@ -335,6 +344,8 @@ class RPE(torch.nn.Module):
 
 
 class SerializedAttention(PointModule):
+    head_projections = PACKED_QKV
+
     def __init__(
             self,
             channels,
@@ -349,12 +360,20 @@ class SerializedAttention(PointModule):
             enable_flash=True,
             upcast_attention=True,
             upcast_softmax=True,
+            attn_kernel: str | None = None,
+            min_head_dim: int | None = None,
     ):
         super().__init__()
         assert channels % num_heads == 0
+        # None keeps the kernel enable_flash selects; "fa4" runs FlashAttention-4 in
+        # that same layout (varlen patches when enable_flash, dense patches otherwise).
+        check_kernel(attn_kernel, (None, FA4), type(self).__name__, attn_drop)
+        self.attn_kernel = attn_kernel
         self.channels = channels
         self.num_heads = num_heads
-        self.scale = qk_scale or (channels // num_heads) ** -0.5
+        self.native_head_dim = channels // num_heads
+        self.head_dim = head_width(channels, num_heads, min_head_dim)
+        self.scale = qk_scale or self.native_head_dim ** -0.5
         self.order_index = order_index
         self.upcast_attention = upcast_attention
         self.upcast_softmax = upcast_softmax
@@ -370,7 +389,9 @@ class SerializedAttention(PointModule):
             assert (
                     upcast_softmax is False
             ), "Set upcast_softmax to False when enable Flash Attention"
-            assert flash_attn is not None, "Make sure flash_attn is installed."
+            assert (
+                flash_attn is not None or attn_kernel == FA4
+            ), "Make sure flash_attn is installed."
             self.patch_size = patch_size
             self.attn_drop = attn_drop
         else:
@@ -381,8 +402,9 @@ class SerializedAttention(PointModule):
             self.patch_size = 0
             self.attn_drop = torch.nn.Dropout(attn_drop)
 
-        self.qkv = torch.nn.Linear(channels, channels * 3, bias=qkv_bias)
-        self.proj = torch.nn.Linear(channels, channels)
+        inner = num_heads * self.head_dim
+        self.qkv = torch.nn.Linear(channels, inner * 3, bias=qkv_bias)
+        self.proj = torch.nn.Linear(inner, channels)
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
@@ -464,7 +486,7 @@ class SerializedAttention(PointModule):
 
         H = self.num_heads
         K = self.patch_size
-        C = self.channels
+        D = self.head_dim
 
         pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
 
@@ -478,7 +500,7 @@ class SerializedAttention(PointModule):
         if not self.enable_flash:
             # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
             q, k, v = (
-                qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
+                qkv.reshape(-1, K, 3, H, D).permute(2, 0, 3, 1, 4).unbind(dim=0)
             )
             # attn
             if self.upcast_attention:
@@ -491,15 +513,15 @@ class SerializedAttention(PointModule):
                 attn = attn.float()
             attn = self.softmax(attn)
             attn = self.attn_drop(attn).to(qkv.dtype)
-            feat = (attn @ v).transpose(1, 2).reshape(-1, C)
+            feat = (attn @ v).transpose(1, 2).reshape(-1, H * D)
         else:
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-                qkv.half().reshape(-1, 3, H, C // H),
+                qkv.half().reshape(-1, 3, H, D),
                 cu_seqlens,
                 max_seqlen=self.patch_size,
                 dropout_p=self.attn_drop if self.training else 0,
                 softmax_scale=self.scale,
-            ).reshape(-1, C)
+            ).reshape(-1, H * D)
             feat = feat.to(qkv.dtype)
         feat = feat[inverse]
 
@@ -525,6 +547,8 @@ class SerializedAttentionRoPE(SerializedAttention):
             enable_flash=True,
             upcast_attention=True,
             upcast_softmax=True,
+            attn_kernel: str | None = None,
+            min_head_dim: int | None = None,
     ):
         super(SerializedAttentionRoPE, self).__init__(
             channels,
@@ -539,6 +563,8 @@ class SerializedAttentionRoPE(SerializedAttention):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
+            attn_kernel=attn_kernel,
+            min_head_dim=min_head_dim,
         )
 
         self.rope3d = RoPE3D()  # TODO: make it configurable
@@ -557,45 +583,35 @@ class SerializedAttentionRoPE(SerializedAttention):
             )
 
         H = self.num_heads
-        K = self.patch_size
-        C = self.channels
+        D = self.head_dim
 
         pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
 
         order = point.serialized_order[self.order_index][pad]
         inverse = unpad[point.serialized_inverse[self.order_index]]
 
+        if not self.enable_flash:
+            feat = self.attend_patches(point, order)[inverse]
+            point.feat = self.proj_drop(self.proj(feat))
+            return point
+
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
 
-        # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
-        if not self.enable_flash:
-            q, k, v = (
-                qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
-            )
-        else:
-            q, k, v = qkv.reshape(-1, 3, H, C // H).permute(1, 2, 0, 3).chunk(3, dim=0)
-
         # the flash branch keeps qkv flat as (1, H, N, C'), so the rotary
-        # positions must stay flat too instead of being split into patches
-        if not self.enable_flash:
-            pos = self.get_pos(point, order).reshape(-1, K, 3)
-        else:
-            pos = self.get_pos(point, order).reshape(1, -1, 3)
+        # positions stay flat too instead of being split into patches
+        q, k, v = qkv.reshape(-1, 3, H, D).permute(1, 2, 0, 3).chunk(3, dim=0)
+        pos = self.get_pos(point, order).reshape(1, -1, 3)
 
-        # print('rope', q.shape, k.shape, v.shape)
-        # apply Rotary Position Embedding
-        q = self.rope3d(q, pos.long())
-        k = self.rope3d(k, pos.long())
+        # apply Rotary Position Embedding to the native part of every head
+        q = rotate_first(self.rope3d, q, pos.long(), self.native_head_dim)
+        k = rotate_first(self.rope3d, k, pos.long(), self.native_head_dim)
 
-        if not self.enable_flash:
-            # attn
-            # (batch_size, seqlen, nheads, headdim)
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
-            feat = memory_efficient_attention(q.to(v.dtype), k.to(v.dtype), v)
-            feat = feat.reshape(-1, C)
+        if self.attn_kernel == FA4:
+            # (1, nheads, total, headdim) -> (total, nheads, headdim), fp16 like flash-attn
+            q, k, v = (t[0].transpose(0, 1).half() for t in (q, k, v))
+            feat = fa4.varlen_attention(q, k, v, cu_seqlens, self.patch_size, self.scale)
+            feat = feat.reshape(-1, H * D).to(qkv.dtype)
         else:
             # (total, 3, nheads, headdim)
             qkv = torch.vstack((q, k, v)).permute(2, 0, 1, 3)
@@ -606,7 +622,7 @@ class SerializedAttentionRoPE(SerializedAttention):
                 max_seqlen=self.patch_size,
                 dropout_p=self.attn_drop if self.training else 0,
                 softmax_scale=self.scale,
-            ).reshape(-1, C)
+            ).reshape(-1, H * D)
 
             feat = feat.to(qkv.dtype)
 
@@ -617,6 +633,52 @@ class SerializedAttentionRoPE(SerializedAttention):
         feat = self.proj_drop(feat)
         point.feat = feat
         return point
+
+    def attend_patches(self, point, order):
+        """Attention inside every patch of ``patch_size`` serialized tokens, in their
+        serialized order: ``(P * K, H * D)``.
+
+        A forward that keeps its graph makes one call over every patch. A patch attends
+        to itself only, so a forward that keeps none sends the patches through the
+        kernel ``PATCH_ATTENTION_TOKENS`` tokens at a time: the widened ``q``, ``k`` and
+        ``v`` then exist for that many tokens and not for the cloud.
+        """
+        pos = self.get_pos(point, order)
+        if torch.is_grad_enabled():
+            return self.attend(self.qkv(point.feat)[order], pos)
+        step = self.patch_size * max(1, PATCH_ATTENTION_TOKENS // self.patch_size)
+        attended = []
+        for start in range(0, order.shape[0], step):
+            qkv = self.qkv(point.feat[order[start: start + step]])
+            attended.append(self.attend(qkv, pos[start: start + step]))
+        return torch.cat(attended)
+
+    def attend(self, qkv, pos):
+        """Rotary attention of packed patches: ``(P * K, 3 * H * D)`` tokens at their
+        ``(P * K, 3)`` positions in, ``(P * K, H * D)`` out."""
+        H = self.num_heads
+        K = self.patch_size
+        D = self.head_dim
+
+        # (P, K, 3, H, D) => three of (P, H, K, D)
+        q, k, v = qkv.reshape(-1, K, 3, H, D).permute(2, 0, 3, 1, 4).unbind(dim=0)
+        pos = pos.reshape(-1, K, 3).long()
+
+        # apply Rotary Position Embedding to the native part of every head
+        q = rotate_first(self.rope3d, q, pos, self.native_head_dim)
+        k = rotate_first(self.rope3d, k, pos, self.native_head_dim)
+
+        # (batch_size, seqlen, nheads, headdim)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+        if self.attn_kernel == FA4:
+            feat = fa4.half_attention(q, k, v, self.scale)
+        else:
+            feat = memory_efficient_attention(
+                q.to(v.dtype), k.to(v.dtype), v, scale=self.scale
+            )
+        return feat.reshape(-1, H * D)
 
 
 class MLP(nn.Module):
@@ -666,6 +728,8 @@ class Block(PointModule):
             enable_flash=True,
             upcast_attention=True,
             upcast_softmax=True,
+            attn_kernel: str | None = None,
+            min_head_dim: int | None = None,
     ):
         super().__init__()
         self.channels = channels
@@ -697,6 +761,8 @@ class Block(PointModule):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
+            attn_kernel=attn_kernel,
+            min_head_dim=min_head_dim,
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
@@ -999,6 +1065,8 @@ class PointTransformerV3(PointModule):
             pdnorm_affine=True,
             replace_bn_norm=False,
             pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+            attn_kernel: str | None = None,
+            min_head_dim: int | None = None,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -1092,6 +1160,8 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        attn_kernel=attn_kernel,
+                        min_head_dim=min_head_dim,
                     ),
                     name=f"block{i}",
                 )
@@ -1144,6 +1214,8 @@ class PointTransformerV3(PointModule):
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
+                            attn_kernel=attn_kernel,
+                            min_head_dim=min_head_dim,
                         ),
                         name=f"block{i}",
                     )
