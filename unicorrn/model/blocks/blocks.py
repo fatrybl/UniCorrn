@@ -353,20 +353,20 @@ class GaussianKNNSample(nn.Module):
         )
 
 
-def knn_sample_3d(
-        input_t, coord_t, sample_coord, k, sigma, return_indices=False, eps=1e-8
-):
+def knn_sample_3d(input_t, coord_t, sample_coord, k, sigma, return_indices=False):
     """
     KNN sample a 3D point cloud, CANNOT handle batched data
+
+    Each sample point averages its k nearest points with the Gaussian weights
+    exp(-d^2 / 2 sigma^2) normalised over the k, computed as a softmax of -d^2 / 2 sigma^2:
+    the same weights, without the underflow that shrinks them to zero once every
+    neighbour lies more than ~6 sigma away.
     """
     # N_sample, k
     knn_distances, knn_indices = knn(
         sample_coord.float(), coord_t.float(), k, return_distance=True
     )
-    sample_weights = torch.exp(-(knn_distances ** 2) / (2 * sigma ** 2))
-    sample_weights_norm = sample_weights / (
-            torch.sum(sample_weights, dim=-1, keepdim=True) + eps
-    )
+    sample_weights_norm = torch.softmax(-(knn_distances ** 2) / (2 * sigma ** 2), dim=-1)
 
     sample_input = index_select(input_t, knn_indices, dim=0)
     if return_indices:
