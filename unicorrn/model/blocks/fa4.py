@@ -8,7 +8,7 @@ the padding off the output. Zero query and key columns add nothing to the dot pr
 and zero value columns produce zero output columns, so the result equals the unpadded
 attention to kernel rounding; the softmax scale is taken from the unpadded width.
 
-Install with ``pip install "flash-attn-4[cu13]==4.0.0b32"`` (a pre-release; unpinned needs
+Install with ``pip install "flash-attn-4[cu13]==4.0.0b37"`` (a pre-release; unpinned needs
 ``--pre``). The forward runs on Ampere and Hopper, the backward on Hopper (sm90) and newer
 only, and there is no attention dropout.
 """
@@ -41,7 +41,7 @@ def configure(module: str, attn_drop: float) -> None:
     if not FA4_AVAILABLE:
         raise ImportError(
             f"{module} is configured for FlashAttention-4 but flash_attn.cute is not "
-            'importable; install it with  pip install "flash-attn-4[cu13]==4.0.0b32"'
+            'importable; install it with  pip install "flash-attn-4[cu13]==4.0.0b37"'
         )
     if attn_drop:
         raise ValueError(f"{module}: FlashAttention-4 has no attention dropout, got {attn_drop}")
