@@ -15,7 +15,7 @@ the DINOv3 contribution grows as training moves the right-hand block. Holding th
 width fixed also keeps every downstream module's shape unchanged. Only the DINOv3 branch
 is layer-normalised, since normalising CroCo would break that identity.
 
-``consumes_raw_image`` tells ``UniCorrn._encode_img`` to hand over raw pixels; the patch
+``consumes_raw_image`` tells ``UniCorrn.encode_img`` to hand over raw pixels; the patch
 embedding CroCo needs is owned here instead of by the model.
 """
 

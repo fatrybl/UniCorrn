@@ -2,7 +2,7 @@
 
 Unlike ``CrocoV2_Encoder`` (which consumes pre-patchified tokens + 2D positions from
 ``ManyAR_PatchEmbed``), DINOv3 is a complete ViT that patchifies and position-encodes the
-raw image internally. The ``consumes_raw_image`` flag tells ``UniCorrn._encode_img`` to
+raw image internally. The ``consumes_raw_image`` flag tells ``UniCorrn.encode_img`` to
 feed the raw pixels here and skip ``patch_embed``. The output matches CrocoV2's contract:
 patch tokens ``[B, N, C]`` on the native ``(H/16, W/16)`` grid (prefix CLS/register tokens
 stripped), returned as ``(tokens, None, None)``.

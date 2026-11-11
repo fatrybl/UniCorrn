@@ -82,7 +82,8 @@ class UniCorrn(nn.Module):
         self.feat_encoder.joint_finetune_trainable()
         self.decoder.joint_finetune_trainable()
 
-    def _encode_img(self, img):
+    def encode_img(self, img):
+        """Image patch features; the point-to-image forward can take them cached."""
         # DINOv3-style backbones patchify the raw image themselves; CrocoV2 needs
         # pre-patchified tokens + 2D positions from patch_embed.
         if getattr(self.img_encoder, "consumes_raw_image", False):
@@ -208,7 +209,7 @@ class UniCorrn(nn.Module):
                 sample["points"].device
             ),
         }
-        src_feat = self._encode_img(src_img)
+        src_feat = self.encode_img(src_img)
         tgt_point = self.pcd_encoder(tgt_point)
 
         (src_feat, tgt_point, patch_shape, patch_coord_map) = (
@@ -305,7 +306,7 @@ class UniCorrn(nn.Module):
             ),
         }
         src_point = self.pcd_encoder(src_point)
-        tgt_feat = self._encode_img(tgt_img) if cached_img_feat is None else cached_img_feat
+        tgt_feat = self.encode_img(tgt_img) if cached_img_feat is None else cached_img_feat
 
         (src_point, tgt_feat, patch_shape, patch_coord_map) = (
             self.feat_encoder.forward_pcd_to_img(src_point, tgt_feat, img_H=H, img_W=W)
