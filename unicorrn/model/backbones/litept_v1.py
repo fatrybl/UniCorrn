@@ -339,6 +339,19 @@ class MLP(nn.Module):
         return x
 
 
+def in_single_precision(module: PointModule, point: Point) -> Point:
+    """Run a point module in single precision, whatever mixed precision surrounds it.
+
+    Args:
+        module: The module to run; it reads the features and the cached sparse tensor.
+        point: The cloud, whose features and sparse tensor are recast in place.
+    """
+    with torch.autocast(device_type=point.feat.device.type, enabled=False):
+        point.feat = point.feat.float()
+        point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
+        return module(point)
+
+
 class Block(PointModule):
     def __init__(
         self,
@@ -438,10 +451,7 @@ class Block(PointModule):
         # tensor, which is re-wrapped too); training is untouched.
         if self.training:
             return self.conv(point)
-        with torch.autocast(device_type=point.feat.device.type, enabled=False):
-            point.feat = point.feat.float()
-            point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
-            return self.conv(point)
+        return in_single_precision(self.conv, point)
 
     def _forward(self, point: Point):
         if self.enable_conv:
@@ -675,9 +685,18 @@ class Embedding(PointModule):
         if act_layer is not None:
             self.stem.add(act_layer(), name="act")
 
-    def forward(self, point: Point):
-        point = self.stem(point)
-        return point
+    def forward(self, point: Point) -> Point:
+        """Embed the cloud's features, in single precision while the model trains.
+
+        The stem's backward holds the encoder's largest gradients, the first to overflow
+        half precision under a scaled loss; inference keeps the ambient precision.
+
+        Args:
+            point: The sparsified cloud.
+        """
+        if self.training:
+            return in_single_precision(self.stem, point)
+        return self.stem(point)
 
 
 class LitePT(PointModule):
